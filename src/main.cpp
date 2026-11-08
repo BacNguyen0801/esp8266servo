@@ -25,7 +25,7 @@ constexpr uint8_t SID_SET_SERVO_ANGLE = 0x31;
 // Shared data
 // ============================================================
 
-volatile uint16_t g_targetAngle = 0;
+volatile uint16_t g_targetAngle = 90;
 volatile bool g_newCommand = false;
 
 uint16_t g_currentAngle = 90;
@@ -214,8 +214,7 @@ void setup()
     Serial.println("ESP8266 NodeMCU Started");
 
     g_servo.attach(SERVO_PIN);
-    int8_t targetValue = ValueToSpeed(targetAngle);
-    servoSetSpeed(targetValue);
+    servoSetSpeed(-100); // Stop the servo at startup
 
     Serial.println("[INIT] Servo initialized on D2");
     Serial.println("[INIT] Binary RX protocol enabled");
