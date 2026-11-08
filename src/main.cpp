@@ -25,10 +25,10 @@ constexpr uint8_t SID_SET_SERVO_ANGLE = 0x31;
 // Shared data
 // ============================================================
 
-volatile uint8_t g_targetAngle = 90;
+volatile uint16_t g_targetAngle = 0;
 volatile bool g_newCommand = false;
 
-uint8_t g_currentAngle = 90;
+uint16_t g_currentAngle = 90;
 uint32_t g_aliveCounter = 0;
 
 Servo g_servo;
@@ -79,7 +79,7 @@ void ProcessCommand(const uint8_t *data, uint8_t length)
                 return;
             }
 
-            g_targetAngle = (uint8_t)angle;
+            g_targetAngle = angle;
             g_newCommand = true;
 
             Serial.printf("[RX] Set servo value: %u\n", angle);
@@ -176,7 +176,7 @@ void MotorControlTask()
     if (!g_newCommand)
         return;
 
-    uint8_t targetAngle = g_targetAngle;
+    uint16_t targetAngle = g_targetAngle;
     g_newCommand = false;
 
     int8_t targetValue = ValueToSpeed(targetAngle);
@@ -214,7 +214,8 @@ void setup()
     Serial.println("ESP8266 NodeMCU Started");
 
     g_servo.attach(SERVO_PIN);
-    servoSetSpeed(0);
+    int8_t targetValue = ValueToSpeed(targetAngle);
+    servoSetSpeed(targetValue);
 
     Serial.println("[INIT] Servo initialized on D2");
     Serial.println("[INIT] Binary RX protocol enabled");
