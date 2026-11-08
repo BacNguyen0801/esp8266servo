@@ -57,9 +57,9 @@ void ProcessCommand(const uint8_t *data, uint8_t length)
             uint8_t channel = data[1];
             uint8_t cmdHi = data[2];
             uint8_t cmdLow = data[3];
-            uint8_t valueLow = data[4];
-            uint8_t valueHigh = data[5];
-            uint16_t angle = (uint16_t)valueLow | ((uint16_t)valueHigh << 8);
+            uint8_t valueHigh = data[4];
+            uint8_t valueLow = data[5];
+            uint16_t angle = ((uint16_t)valueHigh << 8) | valueLow;
 
             if (channel != 0x01)
             {
@@ -141,14 +141,13 @@ uint16_t ValueToMicroseconds(uint16_t value)
 {
     // SG90 360° continuous rotation:
     // 0 -> 1000 (full counter-clockwise)
-    // 90 -> 1500 (stop)
-    // 180 -> 2000 (full clockwise)
-    // values are kept in the range 0..180 for speed control
-    if (value > 180)
-        value = 180;
+    // 180 -> 1500 (stop)
+    // 360 -> 2000 (full clockwise)
+    if (value > 360)
+        value = 360;
 
-    // map 0..180 to 1000..2000 with 90 => 1500
-    int32_t us = 1000 + ((int32_t)value * 1000 / 180);
+    // map 0..360 to 1000..2000 with 180 => 1500
+    int32_t us = 1000 + ((int32_t)value * 1000 / 360);
     return constrain((uint16_t)us, 1000U, 2000U);
 }
 
