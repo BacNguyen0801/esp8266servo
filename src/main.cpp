@@ -137,38 +137,25 @@ void SerialRxTask()
 // Task 2: Servo motor control
 // ============================================================
 
-int8_t ValueToSpeed(uint16_t value)
+uint16_t ValueToMicroseconds(uint16_t value)
 {
-    // SG90 360° continuous rotation: 0 = max reverse, 90 = stop, 180 = max forward
-    // Accept incoming raw value 0..360, but scale around the stop point at 90.
-    if (value > 360)
-        value = 360;
+    // SG90 360° continuous rotation:
+    // 0 -> 1000 (full counter-clockwise)
+    // 90 -> 1500 (stop)
+    // 180 -> 2000 (full clockwise)
+    // values are kept in the range 0..180 for speed control
+    if (value > 180)
+        value = 180;
 
-    int32_t speed;
-
-    if (value < 90)
-    {
-        speed = -100 + ((int32_t)value * 100 / 90);
-    }
-    else if (value > 90)
-    {
-        speed = ((int32_t)value - 90) * 100 / 90;
-    }
-    else
-    {
-        speed = 0;
-    }
-
-    return constrain((int8_t)speed, -100, 100);
+    // map 0..180 to 1000..2000 with 90 => 1500
+    int32_t us = 1000 + ((int32_t)value * 1000 / 180);
+    return constrain((uint16_t)us, 1000U, 2000U);
 }
 
-void servoSetSpeed(int8_t speed)
+void servoSetSpeed(uint16_t value)
 {
-    // speed: -100 to +100
-    speed = constrain(speed, -100, 100);
-
-    int pwm = map(speed, -100, 100, 0, 180);
-    g_servo.write(pwm);
+    uint16_t us = ValueToMicroseconds(value);
+    g_servo.writeMicroseconds(us);
 }
 
 void MotorControlTask()
@@ -179,12 +166,12 @@ void MotorControlTask()
     uint16_t targetAngle = g_targetAngle;
     g_newCommand = false;
 
-    int8_t targetValue = ValueToSpeed(targetAngle);
-    servoSetSpeed(targetValue);
+    uint16_t us = ValueToMicroseconds(targetAngle);
+    g_servo.writeMicroseconds(us);
 
     g_currentAngle = targetAngle;
 
-    Serial.printf("[MOTOR] Raw value: %u -> speed: %d\n", g_currentAngle, targetValue);
+    Serial.printf("[MOTOR] Raw value: %u -> us: %u\n", g_currentAngle, us);
 }
 
 // ============================================================
@@ -214,7 +201,7 @@ void setup()
     Serial.println("ESP8266 NodeMCU Started");
 
     g_servo.attach(SERVO_PIN);
-    servoSetSpeed(-100); // Stop the servo at startup
+    g_servo.writeMicroseconds(1500); // stop at startup
 
     Serial.println("[INIT] Servo initialized on D2");
     Serial.println("[INIT] Binary RX protocol enabled");

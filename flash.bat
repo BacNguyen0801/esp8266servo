@@ -12,6 +12,7 @@ set "ARTIFACT=esp8266-nodemcu-firmware"
 set "FIRMWARE=firmware.bin"
 set "BAUD=115200"
 set "COM_PORT="
+set "LOCAL_FIRMWARE="
 
 set "DOWNLOAD_DIR=%~dp0downloads"
 set "ZIP_FILE=%DOWNLOAD_DIR%\firmware.zip"
@@ -42,6 +43,22 @@ if /I "%~1"=="-baud" (
     goto parse_args
 )
 
+if /I "%~1"=="-f" (
+    if "%~2"=="" goto usage
+    set "LOCAL_FIRMWARE=%~2"
+    shift
+    shift
+    goto parse_args
+)
+
+if /I "%~1"=="--firmware" (
+    if "%~2"=="" goto usage
+    set "LOCAL_FIRMWARE=%~2"
+    shift
+    shift
+    goto parse_args
+)
+
 echo ERROR: Unknown argument %~1
 goto usage
 
@@ -63,6 +80,10 @@ echo Repository : %REPO%
 echo Branch     : %BRANCH%
 echo COM Port   : %COM_PORT%
 echo Baud Rate  : %BAUD%
+if defined LOCAL_FIRMWARE (
+    echo Firmware   : %LOCAL_FIRMWARE%
+)
+
 echo ============================================================
 
 REM ============================================================
@@ -91,6 +112,15 @@ if errorlevel 1 (
     if errorlevel 1 exit /b 1
 )
 
+if defined LOCAL_FIRMWARE (
+    if not exist "%LOCAL_FIRMWARE%" (
+        echo ERROR: Local firmware file not found: %LOCAL_FIRMWARE%
+        exit /b 1
+    )
+    set "FIRMWARE_PATH=%LOCAL_FIRMWARE%"
+    goto flash_local
+)
+
 if not exist "%DOWNLOAD_DIR%" mkdir "%DOWNLOAD_DIR%"
 
 if exist "%EXTRACT_DIR%" rmdir /s /q "%EXTRACT_DIR%"
@@ -116,6 +146,8 @@ if errorlevel 1 (
 REM ============================================================
 REM [3/4] Flash ESP8266
 REM ============================================================
+
+:flash_local
 
 echo.
 echo [3/4] Flashing ESP8266...
@@ -157,5 +189,6 @@ echo Usage:
 echo   flash.bat -COM 3
 echo   flash.bat -COM COM3
 echo   flash.bat -COM 3 -baud 460800
+echo   flash.bat -COM 4 -f .pio\build\nodemcuv2\firmware.bin
 echo.
 exit /b 1
