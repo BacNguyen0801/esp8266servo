@@ -19,7 +19,7 @@ void loop()
     static int aliveCounter = 0;
     aliveCounter++;
     digitalWrite(LED_PIN, LOW);
-    Serial.print("Hello, ESP8266! Alive cycles: ");
+    Serial.print("Esp8622 McuNode! Alive cycles: ");
     Serial.println(aliveCounter);
     delay(1000);
 
