@@ -55,7 +55,7 @@ void ProcessCommand(const uint8_t *data, uint8_t length)
 
             uint8_t angle = data[1];
 
-            if (angle > 180)
+            if (angle > 360)
             {
                 Serial.println("[RX] Invalid servo angle");
                 return;
@@ -125,6 +125,24 @@ void SerialRxTask()
 // Task 2: Servo motor control
 // ============================================================
 
+int8_t AngleToValue(uint16_t angle)
+{
+    // 0 -> -100
+    // 180 -> 0
+    // 360 -> 100
+    int32_t value = ((int32_t)angle - 180) * 100 / 180;
+    return constrain(value, -100, 100);
+}
+
+void servoSetSpeed(int8_t speed)
+{
+    // speed: -100 to +100
+    speed = constrain(speed, -100, 100);
+
+    int pwm = map(speed, -100, 100, 0, 180);
+    g_servo.write(pwm);
+}
+
 void MotorControlTask()
 {
     if (!g_newCommand)
@@ -133,10 +151,12 @@ void MotorControlTask()
     uint8_t targetAngle = g_targetAngle;
     g_newCommand = false;
 
-    g_servo.write(targetAngle);
+    int8_t targetValue = AngleToValue(targetAngle);
+    servoSetSpeed(targetValue);
+
     g_currentAngle = targetAngle;
 
-    Serial.printf("[MOTOR] Angle: %u degrees\n", g_currentAngle);
+    Serial.printf("[MOTOR] Angle: %u -> value: %d\n", g_currentAngle, targetValue);
 }
 
 // ============================================================
@@ -166,7 +186,7 @@ void setup()
     Serial.println("ESP8266 NodeMCU Started");
 
     g_servo.attach(SERVO_PIN);
-    g_servo.write(g_currentAngle);
+    servoSetSpeed(0);
 
     Serial.println("[INIT] Servo initialized on D2");
     Serial.println("[INIT] Binary RX protocol enabled");
