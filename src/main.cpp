@@ -16,8 +16,10 @@ void setup()
 
 void loop()
 {
+    static int aliveCounter = 0;
+    aliveCounter++;
     digitalWrite(LED_PIN, LOW);
-    Serial.println("Hello, ESP8266!");
+    Serial.println("Hello, ESP8266! Alive cycles: %d", aliveCounter);
     delay(1000);
 
     digitalWrite(LED_PIN, HIGH);
