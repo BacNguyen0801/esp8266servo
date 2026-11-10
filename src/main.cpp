@@ -6,14 +6,21 @@
 // Configuration
 // ============================================================
 
-constexpr uint8_t SERVO_PIN = D2;
+constexpr uint8_t SERVO_PIN = 4;
 
 constexpr uint32_t RX_TASK_INTERVAL_MS    = 10;
 constexpr uint32_t MOTOR_TASK_INTERVAL_MS = 20;
 constexpr uint32_t ALIVE_TASK_INTERVAL_MS = 1000;
 
 constexpr uint8_t MAX_FRAME_LENGTH = 8;
-constexpr uint8_t COMMAND_FRAME_LENGTH = 6; // [SID, CH, 0xF0, 0x01, VALUE_LOW, VALUE_HIGH]
+constexpr uint8_t COMMAND_LENGTH_BYTE = 0x05;
+constexpr uint8_t COMMAND_FRAME_LENGTH = 5; // [SID, CH, 0xF0, 0x01, DIRECTION]
+constexpr uint8_t COMMAND_FRAME_WITH_LENGTH_LENGTH = 6; // [LEN, SID, CH, 0xF0, 0x01, DIRECTION]
+
+constexpr uint16_t SERVO_STOP_US = 1500;
+constexpr uint16_t SERVO_CLOCKWISE_US = 1600;
+constexpr uint16_t SERVO_ANTICLOCKWISE_US = 1400;
+constexpr uint32_t SERVO_RUN_DURATION_MS = 100;
 
 // ============================================================
 // UDS-style Service IDs
@@ -25,10 +32,11 @@ constexpr uint8_t SID_SET_SERVO_ANGLE = 0x31;
 // Shared data
 // ============================================================
 
-volatile uint16_t g_targetAngle = 90;
+volatile uint16_t g_targetPulseUs = SERVO_STOP_US;
 volatile bool g_newCommand = false;
+volatile uint32_t g_commandStartMs = 0;
 
-uint16_t g_currentAngle = 90;
+uint16_t g_currentPulseUs = SERVO_STOP_US;
 uint32_t g_aliveCounter = 0;
 
 Servo g_servo;
@@ -42,24 +50,42 @@ void ProcessCommand(const uint8_t *data, uint8_t length)
     if (length == 0)
         return;
 
-    uint8_t sid = data[0];
+    const uint8_t *frame = data;
+    uint8_t frameLength = length;
+
+    if (length == COMMAND_FRAME_WITH_LENGTH_LENGTH)
+    {
+        if (data[0] != COMMAND_LENGTH_BYTE)
+        {
+            Serial.printf("[RX] Invalid frame length byte: 0x%02X\n", data[0]);
+            return;
+        }
+
+        frame = data + 1;
+        frameLength = COMMAND_FRAME_LENGTH;
+    }
+    else if (length != COMMAND_FRAME_LENGTH)
+    {
+        Serial.printf("[RX] Invalid command length: %u\n", length);
+        return;
+    }
+
+    uint8_t sid = frame[0];
 
     switch (sid)
     {
         case SID_SET_SERVO_ANGLE:
         {
-            if (length != COMMAND_FRAME_LENGTH)
+            if (frameLength != COMMAND_FRAME_LENGTH)
             {
                 Serial.println("[RX] Invalid command length");
                 return;
             }
 
-            uint8_t channel = data[1];
-            uint8_t cmdHi = data[2];
-            uint8_t cmdLow = data[3];
-            uint8_t valueHigh = data[4];
-            uint8_t valueLow = data[5];
-            uint16_t angle = ((uint16_t)valueHigh << 8) | valueLow;
+            uint8_t channel = frame[1];
+            uint8_t cmdHi = frame[2];
+            uint8_t cmdLow = frame[3];
+            uint8_t direction = frame[4];
 
             if (channel != 0x01)
             {
@@ -73,16 +99,29 @@ void ProcessCommand(const uint8_t *data, uint8_t length)
                 return;
             }
 
-                    if (angle > 360)
+            uint16_t pulseUs;
+            switch (direction)
             {
-                Serial.println("[RX] Invalid servo angle");
-                return;
+                case 0x00:
+                    pulseUs = SERVO_CLOCKWISE_US;
+                    break;
+
+                case 0x01:
+                    pulseUs = SERVO_ANTICLOCKWISE_US;
+                    break;
+
+                default:
+                    Serial.printf("[RX] Invalid direction: 0x%02X\n", direction);
+                    return;
             }
 
-            g_targetAngle = angle;
+            g_targetPulseUs = pulseUs;
+            g_commandStartMs = millis();
             g_newCommand = true;
 
-            Serial.printf("[RX] Set servo value: %u\n", angle);
+            Serial.printf("[RX] Set servo direction: %s -> %u us\n",
+                          (direction == 0x00) ? "clockwise" : "anticlockwise",
+                          pulseUs);
             break;
         }
 
@@ -94,13 +133,15 @@ void ProcessCommand(const uint8_t *data, uint8_t length)
 
 // ============================================================
 // Task 1: Serial RX
-// Frame: LEN | SID | PARAM...
+// Frame: LEN | SID | CH | 0xF0 | 0x01 | DIRECTION
+// First byte must be 0x05 for the length-prefixed protocol.
 // ============================================================
 
 void SerialRxTask()
 {
     static uint8_t rxBuffer[MAX_FRAME_LENGTH];
     static uint8_t receivedLength = 0;
+    static uint8_t expectedLength = 0;
 
     while (Serial.available() > 0)
     {
@@ -108,16 +149,20 @@ void SerialRxTask()
 
         if (receivedLength == 0)
         {
-            if (rxByte != SID_SET_SERVO_ANGLE)
+            if (rxByte != SID_SET_SERVO_ANGLE && rxByte != COMMAND_LENGTH_BYTE)
             {
                 Serial.printf("[RX] Invalid header: 0x%02X\n", rxByte);
                 continue;
             }
+
+            rxBuffer[receivedLength++] = rxByte;
+            expectedLength = (rxByte == COMMAND_LENGTH_BYTE) ? COMMAND_FRAME_WITH_LENGTH_LENGTH : COMMAND_FRAME_LENGTH;
+            continue;
         }
 
         rxBuffer[receivedLength++] = rxByte;
 
-        if (receivedLength == COMMAND_FRAME_LENGTH)
+        if (receivedLength == expectedLength)
         {
             Serial.print("[RX] Frame: ");
 
@@ -129,6 +174,7 @@ void SerialRxTask()
             ProcessCommand(rxBuffer, receivedLength);
 
             receivedLength = 0;
+            expectedLength = 0;
         }
     }
 }
@@ -137,40 +183,31 @@ void SerialRxTask()
 // Task 2: Servo motor control
 // ============================================================
 
-uint16_t ValueToMicroseconds(uint16_t value)
-{
-    // SG90 360° continuous rotation:
-    // 0 -> 1000 (full counter-clockwise)
-    // 180 -> 1500 (stop)
-    // 360 -> 2000 (full clockwise)
-    if (value > 360)
-        value = 360;
-
-    // map 0..360 to 1000..2000 with 180 => 1500
-    int32_t us = 1000 + ((int32_t)value * 1000 / 360);
-    return constrain((uint16_t)us, 1000U, 2000U);
-}
-
-void servoSetSpeed(uint16_t value)
-{
-    uint16_t us = ValueToMicroseconds(value);
-    g_servo.writeMicroseconds(us);
-}
-
 void MotorControlTask()
 {
     if (!g_newCommand)
         return;
 
-    uint16_t targetAngle = g_targetAngle;
-    g_newCommand = false;
+    uint32_t elapsedMs = millis() - g_commandStartMs;
 
-    uint16_t us = ValueToMicroseconds(targetAngle);
-    g_servo.writeMicroseconds(us);
+    if (elapsedMs >= SERVO_RUN_DURATION_MS)
+    {
+        g_servo.writeMicroseconds(SERVO_STOP_US);
+        g_newCommand = false;
+        g_currentPulseUs = SERVO_STOP_US;
+        Serial.printf("[MOTOR] Stop after %lu ms -> %u us\n",
+                      (unsigned long)SERVO_RUN_DURATION_MS,
+                      SERVO_STOP_US);
+        return;
+    }
 
-    g_currentAngle = targetAngle;
+    uint16_t pulseUs = g_targetPulseUs;
+    g_servo.writeMicroseconds(pulseUs);
+    g_currentPulseUs = pulseUs;
 
-    Serial.printf("[MOTOR] Raw value: %u -> us: %u\n", g_currentAngle, us);
+    Serial.printf("[MOTOR] Active pulse: %u us (elapsed %lu ms)\n",
+                  pulseUs,
+                  (unsigned long)elapsedMs);
 }
 
 // ============================================================
