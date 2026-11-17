@@ -21,12 +21,22 @@ constexpr uint16_t SERVO_STOP_US = 1500;
 constexpr uint16_t SERVO_CLOCKWISE_US = 1600;
 constexpr uint16_t SERVO_ANTICLOCKWISE_US = 1400;
 constexpr uint32_t SERVO_RUN_DURATION_MS = 100;
+constexpr uint8_t ADC_INPUT_PIN = A0;
+constexpr uint8_t ADC_VOLTAGE_MIN_TARGET_V = 3;
+constexpr uint8_t ADC_VOLTAGE_MAX_TARGET_V = 24;
+constexpr uint8_t ADC_VOLTAGE_FULL_SCALE_V = ADC_VOLTAGE_MAX_TARGET_V;
 
 // ============================================================
 // UDS-style Service IDs
 // ============================================================
 
 constexpr uint8_t SID_SET_SERVO_ANGLE = 0x31;
+constexpr uint8_t SID_SET_SERVO_ANGLE_RESPONSE = 0x71;
+constexpr uint8_t CMD_SET_SERVO_DIRECTION_HI = 0xF0;
+constexpr uint8_t CMD_SET_SERVO_DIRECTION_LOW = 0x01;
+constexpr uint8_t CMD_SET_VOLTAGE_TARGET_HI = 0xC0;
+constexpr uint8_t CMD_SET_VOLTAGE_TARGET_LOW = 0x01;
+constexpr uint8_t UDS_POSITIVE_RESPONSE_LENGTH = 4; // [SID, CH, CMD_HI, CMD_LOW]
 
 // ============================================================
 // Shared data
@@ -35,6 +45,9 @@ constexpr uint8_t SID_SET_SERVO_ANGLE = 0x31;
 volatile uint16_t g_targetPulseUs = SERVO_STOP_US;
 volatile bool g_newCommand = false;
 volatile uint32_t g_commandStartMs = 0;
+volatile bool g_voltageControlActive = false;
+volatile bool g_voltageIncreaseTarget = false;
+volatile uint8_t g_voltageTargetV = 0;
 
 uint16_t g_currentPulseUs = SERVO_STOP_US;
 uint32_t g_aliveCounter = 0;
@@ -44,6 +57,48 @@ Servo g_servo;
 // ============================================================
 // Command processing
 // ============================================================
+
+float ReadMeasuredVoltageV()
+{
+    int raw = analogRead(ADC_INPUT_PIN);
+    return (raw * ADC_VOLTAGE_FULL_SCALE_V) / 1023.0f;
+}
+
+void SendPositiveUdsResponse(uint8_t cmdHi, uint8_t cmdLow)
+{
+    static const uint8_t response[UDS_POSITIVE_RESPONSE_LENGTH] =
+    {
+        SID_SET_SERVO_ANGLE_RESPONSE,
+        0x01,
+        cmdHi,
+        cmdLow
+    };
+
+    Serial.write(response, sizeof(response));
+    Serial.println();
+
+    Serial.printf("[RX] UDSResp(%02X%02X%02X%02X)\n",
+                  response[0], response[1], response[2], response[3]);
+}
+
+bool IsVoltageTargetReached(float currentVoltageV, bool increaseTarget, uint8_t targetVoltageV)
+{
+    return increaseTarget
+        ? (currentVoltageV >= static_cast<float>(targetVoltageV))
+        : (currentVoltageV <= static_cast<float>(targetVoltageV));
+}
+
+void CompleteVoltageAdjustment()
+{
+    g_servo.writeMicroseconds(SERVO_STOP_US);
+    g_newCommand = false;
+    g_voltageControlActive = false;
+    g_voltageIncreaseTarget = false;
+    g_voltageTargetV = 0;
+    g_currentPulseUs = SERVO_STOP_US;
+
+    SendPositiveUdsResponse(CMD_SET_VOLTAGE_TARGET_HI, CMD_SET_VOLTAGE_TARGET_LOW);
+}
 
 void ProcessCommand(const uint8_t *data, uint8_t length)
 {
@@ -85,7 +140,7 @@ void ProcessCommand(const uint8_t *data, uint8_t length)
             uint8_t channel = frame[1];
             uint8_t cmdHi = frame[2];
             uint8_t cmdLow = frame[3];
-            uint8_t direction = frame[4];
+            uint8_t value = frame[4];
 
             if (channel != 0x01)
             {
@@ -93,35 +148,62 @@ void ProcessCommand(const uint8_t *data, uint8_t length)
                 return;
             }
 
-            if (cmdHi != 0xF0 || cmdLow != 0x01)
+            if (cmdHi == CMD_SET_SERVO_DIRECTION_HI && cmdLow == CMD_SET_SERVO_DIRECTION_LOW)
             {
-                Serial.printf("[RX] Unsupported command: %02X %02X\n", cmdHi, cmdLow);
-                return;
+                uint16_t pulseUs;
+                switch (value)
+                {
+                    case 0x00:
+                        pulseUs = SERVO_CLOCKWISE_US;
+                        break;
+
+                    case 0x01:
+                        pulseUs = SERVO_ANTICLOCKWISE_US;
+                        break;
+
+                    default:
+                        Serial.printf("[RX] Invalid direction: 0x%02X\n", value);
+                        return;
+                }
+
+                g_targetPulseUs = pulseUs;
+                g_commandStartMs = millis();
+                g_voltageControlActive = false;
+                g_voltageIncreaseTarget = false;
+                g_voltageTargetV = 0;
+                g_newCommand = true;
+
+                Serial.printf("[RX] Set servo direction: %s -> %u us\n",
+                              (value == 0x00) ? "clockwise" : "anticlockwise",
+                              pulseUs);
+                break;
             }
 
-            uint16_t pulseUs;
-            switch (direction)
+            if (cmdHi == CMD_SET_VOLTAGE_TARGET_HI && cmdLow == CMD_SET_VOLTAGE_TARGET_LOW)
             {
-                case 0x00:
-                    pulseUs = SERVO_CLOCKWISE_US;
-                    break;
-
-                case 0x01:
-                    pulseUs = SERVO_ANTICLOCKWISE_US;
-                    break;
-
-                default:
-                    Serial.printf("[RX] Invalid direction: 0x%02X\n", direction);
+                if (value < ADC_VOLTAGE_MIN_TARGET_V || value > ADC_VOLTAGE_MAX_TARGET_V)
+                {
+                    Serial.printf("[RX] Invalid target voltage: %u V (valid 3..24 V)\n", value);
                     return;
+                }
+
+                const float currentVoltageV = ReadMeasuredVoltageV();
+                const bool shouldIncrease = currentVoltageV < value;
+                g_targetPulseUs = shouldIncrease ? SERVO_CLOCKWISE_US : SERVO_ANTICLOCKWISE_US;
+                g_commandStartMs = millis();
+                g_voltageControlActive = true;
+                g_voltageIncreaseTarget = shouldIncrease;
+                g_voltageTargetV = value;
+                g_newCommand = true;
+
+                Serial.printf("[RX] Set voltage target: %u V, current %.2f V -> %s\n",
+                              value,
+                              currentVoltageV,
+                              shouldIncrease ? "clockwise" : "anticlockwise");
+                break;
             }
 
-            g_targetPulseUs = pulseUs;
-            g_commandStartMs = millis();
-            g_newCommand = true;
-
-            Serial.printf("[RX] Set servo direction: %s -> %u us\n",
-                          (direction == 0x00) ? "clockwise" : "anticlockwise",
-                          pulseUs);
+            Serial.printf("[RX] Unsupported command: %02X %02X\n", cmdHi, cmdLow);
             break;
         }
 
@@ -188,20 +270,78 @@ void MotorControlTask()
     if (!g_newCommand)
         return;
 
-    uint32_t elapsedMs = millis() - g_commandStartMs;
+    const uint32_t elapsedMs = millis() - g_commandStartMs;
+
+    if (g_voltageControlActive)
+    {
+        const float currentVoltageV = ReadMeasuredVoltageV();
+
+        if (IsVoltageTargetReached(currentVoltageV, g_voltageIncreaseTarget, g_voltageTargetV))
+        {
+            CompleteVoltageAdjustment();
+            Serial.printf("[MOTOR] Voltage target reached: %.2f V (target %u V, elapsed %lu ms)\n",
+                          currentVoltageV,
+                          g_voltageTargetV,
+                          (unsigned long)elapsedMs);
+            return;
+        }
+
+        if (elapsedMs >= SERVO_RUN_DURATION_MS)
+        {
+            g_servo.writeMicroseconds(SERVO_STOP_US);
+            g_currentPulseUs = SERVO_STOP_US;
+
+            const float measuredAfterStopV = ReadMeasuredVoltageV();
+            const bool finishedAfterStop = IsVoltageTargetReached(
+                measuredAfterStopV,
+                g_voltageIncreaseTarget,
+                g_voltageTargetV
+            );
+
+            Serial.printf("[MOTOR] Step complete: %.2f V / %u V -> %s\n",
+                          measuredAfterStopV,
+                          g_voltageTargetV,
+                          finishedAfterStop ? "done" : "continue");
+
+            if (finishedAfterStop)
+            {
+                CompleteVoltageAdjustment();
+                return;
+            }
+
+            g_commandStartMs = millis();
+            return;
+        }
+
+        const bool needIncrease = currentVoltageV < static_cast<float>(g_voltageTargetV);
+        const uint16_t pulseUs = needIncrease ? SERVO_CLOCKWISE_US : SERVO_ANTICLOCKWISE_US;
+
+        g_servo.writeMicroseconds(pulseUs);
+        g_currentPulseUs = pulseUs;
+
+        Serial.printf("[MOTOR] Voltage step: %.2f V / %u V -> %s, elapsed %lu ms\n",
+                      currentVoltageV,
+                      g_voltageTargetV,
+                      needIncrease ? "clockwise" : "anticlockwise",
+                      (unsigned long)elapsedMs);
+        return;
+    }
 
     if (elapsedMs >= SERVO_RUN_DURATION_MS)
     {
         g_servo.writeMicroseconds(SERVO_STOP_US);
         g_newCommand = false;
         g_currentPulseUs = SERVO_STOP_US;
+
+        SendPositiveUdsResponse(CMD_SET_SERVO_DIRECTION_HI, CMD_SET_SERVO_DIRECTION_LOW);
+
         Serial.printf("[MOTOR] Stop after %lu ms -> %u us\n",
                       (unsigned long)SERVO_RUN_DURATION_MS,
                       SERVO_STOP_US);
         return;
     }
 
-    uint16_t pulseUs = g_targetPulseUs;
+    const uint16_t pulseUs = g_targetPulseUs;
     g_servo.writeMicroseconds(pulseUs);
     g_currentPulseUs = pulseUs;
 
@@ -236,10 +376,12 @@ void setup()
     Serial.println();
     Serial.println("ESP8266 NodeMCU Started");
 
+    pinMode(ADC_INPUT_PIN, INPUT);
     g_servo.attach(SERVO_PIN);
     g_servo.writeMicroseconds(1500); // stop at startup
 
     Serial.println("[INIT] Servo initialized on D2");
+    Serial.println("[INIT] ADC voltage monitoring enabled on A0");
     Serial.println("[INIT] Binary RX protocol enabled");
 }
 
