@@ -25,8 +25,6 @@ constexpr uint8_t ADC_INPUT_PIN = A0;
 constexpr uint8_t ADC_VOLTAGE_MIN_TARGET_TENTHS = 3;  // 0.3V in 0.1V units
 constexpr uint8_t ADC_VOLTAGE_MAX_TARGET_TENTHS = 24; // 2.4V in 0.1V units
 constexpr uint16_t ADC_MAX_RAW = 1023;
-constexpr uint16_t ADC_DIVIDER_NUMERATOR = 10000; // 10:1 divider => Vin = Vadc * 10
-constexpr uint16_t ADC_DIVIDER_DENOMINATOR = 1000; // 0.1 scaling factor
 
 // ============================================================
 // UDS-style Service IDs
@@ -63,8 +61,7 @@ Servo g_servo;
 uint16_t ReadMeasuredVoltageV()
 {
     const uint16_t raw = analogRead(ADC_INPUT_PIN);
-    const uint32_t scaledVoltage = (static_cast<uint32_t>(raw) * ADC_DIVIDER_NUMERATOR + (ADC_MAX_RAW / 2)) / ADC_MAX_RAW;
-    return (scaledVoltage * 10u) / ADC_DIVIDER_DENOMINATOR;
+    return (static_cast<uint32_t>(raw) * ADC_VOLTAGE_MAX_TARGET_TENTHS + (ADC_MAX_RAW / 2)) / ADC_MAX_RAW;
 }
 
 void SendPositiveUdsResponse(uint8_t cmdHi, uint8_t cmdLow)
