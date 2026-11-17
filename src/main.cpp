@@ -22,11 +22,11 @@ constexpr uint16_t SERVO_CLOCKWISE_US = 1600;
 constexpr uint16_t SERVO_ANTICLOCKWISE_US = 1400;
 constexpr uint32_t SERVO_RUN_DURATION_MS = 100;
 constexpr uint8_t ADC_INPUT_PIN = A0;
-constexpr uint8_t ADC_VOLTAGE_MIN_TARGET_V = 3;
-constexpr uint8_t ADC_VOLTAGE_MAX_TARGET_V = 24;
+constexpr uint8_t ADC_VOLTAGE_MIN_TARGET_TENTHS = 3;  // 0.3V in 0.1V units
+constexpr uint8_t ADC_VOLTAGE_MAX_TARGET_TENTHS = 24; // 2.4V in 0.1V units
 constexpr uint16_t ADC_MAX_RAW = 1023;
-constexpr uint16_t ADC_DIVIDER_NUMERATOR = 10000; // (R1 + R2) * 1000 = 10000
-constexpr uint16_t ADC_DIVIDER_DENOMINATOR = 9000; // R2 * 1000 = 9000
+constexpr uint16_t ADC_DIVIDER_NUMERATOR = 10000; // 10:1 divider => Vin = Vadc * 10
+constexpr uint16_t ADC_DIVIDER_DENOMINATOR = 1000; // 0.1 scaling factor
 
 // ============================================================
 // UDS-style Service IDs
@@ -63,7 +63,8 @@ Servo g_servo;
 uint16_t ReadMeasuredVoltageV()
 {
     const uint16_t raw = analogRead(ADC_INPUT_PIN);
-    return (static_cast<uint32_t>(raw) * ADC_DIVIDER_NUMERATOR + ADC_MAX_RAW / 2) / (ADC_MAX_RAW * ADC_DIVIDER_DENOMINATOR / 1000u);
+    const uint32_t scaledVoltage = (static_cast<uint32_t>(raw) * ADC_DIVIDER_NUMERATOR + (ADC_MAX_RAW / 2)) / ADC_MAX_RAW;
+    return (scaledVoltage * 10u) / ADC_DIVIDER_DENOMINATOR;
 }
 
 void SendPositiveUdsResponse(uint8_t cmdHi, uint8_t cmdLow)
@@ -183,9 +184,9 @@ void ProcessCommand(const uint8_t *data, uint8_t length)
 
             if (cmdHi == CMD_SET_VOLTAGE_TARGET_HI && cmdLow == CMD_SET_VOLTAGE_TARGET_LOW)
             {
-                if (value < ADC_VOLTAGE_MIN_TARGET_V || value > ADC_VOLTAGE_MAX_TARGET_V)
+                if (value < ADC_VOLTAGE_MIN_TARGET_TENTHS || value > ADC_VOLTAGE_MAX_TARGET_TENTHS)
                 {
-                    Serial.printf("[RX] Invalid target voltage: %u V (valid 3..24 V)\n", value);
+                    Serial.printf("[RX] Invalid target voltage: %u (valid 3..24 in 0.1V units = 0.3..2.4V)\n", value);
                     return;
                 }
 
