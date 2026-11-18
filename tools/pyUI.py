@@ -5,6 +5,8 @@ import time
 import serial
 
 SERVO_SID = 0x31
+ECU_RESET_SID = 0x11
+ECU_RESET_SUB_FUNCTION = 0x01
 SERVO_CHANNEL = 0x01
 SERVO_CMD_HI = 0xF0
 SERVO_CMD_LOW = 0x01
@@ -50,20 +52,25 @@ def parse_raw_command(command_hex):
     if len(cleaned) == 8:
         cleaned = cleaned + "00"
 
-    if len(cleaned) not in (10, 12):
-        raise ValueError("Command must be 10 or 12 hex chars (example: 3101f00100 or 053101f00100)")
-
     try:
         payload = bytes.fromhex(cleaned)
     except ValueError as exc:
         raise ValueError(f"Invalid hex command: {command_hex}") from exc
 
+    if len(payload) == 2:
+        if payload[0] == ECU_RESET_SID and payload[1] == ECU_RESET_SUB_FUNCTION:
+            return bytes([0x02]) + payload
+        raise ValueError("Raw reset command must be 11 01")
+
+    if len(payload) == 3:
+        if payload[0] == 0x02 and payload[1] == ECU_RESET_SID and payload[2] == ECU_RESET_SUB_FUNCTION:
+            return payload
+        raise ValueError("Length-prefixed reset command must be 02 11 01")
+
     if len(payload) == 6:
         if payload[0] != FRAME_LENGTH_BYTE:
-            raise ValueError("Length-prefixed command must start with 05")
+            raise ValueError("Length-prefixed servo command must start with 05")
         frame = payload[1:]
-        if len(frame) != 5:
-            raise ValueError("Length-prefixed frame must resolve to 5 payload bytes")
 
         if frame[0] == 0x31 and frame[1] == 0x01 and frame[2] == 0xF0 and frame[3] == 0x01:
             if frame[4] not in (0x00, 0x01):
@@ -75,7 +82,7 @@ def parse_raw_command(command_hex):
                 raise ValueError(f"Voltage target must be between {VOLTAGE_MIN_V} and {VOLTAGE_MAX_V} V")
             return payload
 
-        raise ValueError("Command must start with 31 01 f0 01 or 31 01 c0 01 after the length byte")
+        raise ValueError("Servo command must start with 31 01 f0 01 or 31 01 c0 01")
 
     if len(payload) == 5:
         if payload[0] == 0x31 and payload[1] == 0x01 and payload[2] == 0xF0 and payload[3] == 0x01:
@@ -88,9 +95,10 @@ def parse_raw_command(command_hex):
                 raise ValueError(f"Voltage target must be between {VOLTAGE_MIN_V} and {VOLTAGE_MAX_V} V")
             return bytes([FRAME_LENGTH_BYTE]) + payload
 
-        raise ValueError("Command must start with 31 01 f0 01 or 31 01 c0 01")
+        raise ValueError("Servo command must start with 31 01 f0 01 or 31 01 c0 01")
 
-    raise ValueError("Command must resolve to either 5 bytes (31 01 <F0/C0> 01 <value>) or 6 bytes (05 31 01 <F0/C0> 01 <value>)")
+    raise ValueError("Supported commands: 11 01, 31 01 f0 01 00/01, or 31 01 c0 01 voltage")
+
 
 def has_uds_response(received):
     if b"UDSResp" in received:
@@ -101,6 +109,12 @@ def has_uds_response(received):
                 received[index + 1] == SERVO_CHANNEL and
                 received[index + 2] in (SERVO_CMD_HI, SERVO_VOLTAGE_CMD_HI) and
                 received[index + 3] == SERVO_CMD_LOW):
+            return True
+
+    for index in range(max(0, len(received) - 1)):
+        if (received[index] == 0x51 and
+                index + 1 < len(received) and
+                received[index + 1] == ECU_RESET_SUB_FUNCTION):
             return True
 
     return False
@@ -299,11 +313,13 @@ class ServoControlWindow(QWidget):
         right_btn = QPushButton("Rotate Right")
         right_btn.setObjectName("rightBtn")
         voltage_btn = QPushButton("SET VOLT")
+        reset_btn = QPushButton("RESET MCU")
 
         self.connection_btn.clicked.connect(self.toggle_connection)
         left_btn.clicked.connect(lambda: self.send_direction(DIRECTION_LEFT))
         right_btn.clicked.connect(lambda: self.send_direction(DIRECTION_RIGHT))
         voltage_btn.clicked.connect(self.send_voltage_target)
+        reset_btn.clicked.connect(self.send_reset)
 
         port_row = QHBoxLayout()
         port_row.addWidget(QLabel("COM Port:"))
@@ -318,6 +334,7 @@ class ServoControlWindow(QWidget):
         button_row = QHBoxLayout()
         button_row.addWidget(left_btn)
         button_row.addWidget(right_btn)
+        button_row.addWidget(reset_btn)
 
         root_layout = QVBoxLayout(self)
         root_layout.addLayout(port_row)
@@ -444,6 +461,21 @@ class ServoControlWindow(QWidget):
             )
         else:
             self.append_log("FAILED TO SEND VOLTAGE TARGET")
+
+    def send_reset(self):
+        if not self.serial_port or not self.serial_port.isOpen():
+            self.append_log("CONNECT TO A COM PORT FIRST")
+            return
+
+        packet = bytes([0x02, ECU_RESET_SID, ECU_RESET_SUB_FUNCTION])
+        written = self.serial_port.write(packet)
+        self.serial_port.flush()
+
+        if written >= 0:
+            uart_hex = " ".join(f"{b:02X}" for b in packet)
+            self.append_log(f"SENT: {uart_hex} | reset MCU")
+        else:
+            self.append_log("FAILED TO SEND RESET COMMAND")
 
     def closeEvent(self, event):
         if self.serial_port and self.serial_port.isOpen():

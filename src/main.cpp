@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <Servo.h>
+#include <Esp.h>
 
 // ============================================================
 // Configuration
@@ -13,8 +14,11 @@ constexpr uint32_t ALIVE_TASK_INTERVAL_MS = 10000;
 
 constexpr uint8_t MAX_FRAME_LENGTH = 8;
 constexpr uint8_t COMMAND_LENGTH_BYTE = 0x05;
+constexpr uint8_t RESET_COMMAND_LENGTH_BYTE = 0x02;
 constexpr uint8_t COMMAND_FRAME_LENGTH = 5; // [SID, CH, 0xF0, 0x01, DIRECTION]
 constexpr uint8_t COMMAND_FRAME_WITH_LENGTH_LENGTH = 6; // [LEN, SID, CH, 0xF0, 0x01, DIRECTION]
+constexpr uint8_t RESET_COMMAND_FRAME_LENGTH = 2; // [SID, SUB_FUNCTION]
+constexpr uint8_t RESET_COMMAND_FRAME_WITH_LENGTH_LENGTH = 3; // [LEN, SID, SUB_FUNCTION]
 
 constexpr uint16_t SERVO_STOP_US = 1500;
 constexpr uint16_t SERVO_CLOCKWISE_US = 1600;
@@ -38,6 +42,10 @@ constexpr uint8_t CMD_SET_SERVO_DIRECTION_LOW = 0x01;
 constexpr uint8_t CMD_SET_VOLTAGE_TARGET_HI = 0xC0;
 constexpr uint8_t CMD_SET_VOLTAGE_TARGET_LOW = 0x01;
 constexpr uint8_t UDS_POSITIVE_RESPONSE_LENGTH = 4; // [SID, CH, CMD_HI, CMD_LOW]
+
+constexpr uint8_t SID_ECU_RESET = 0x11;
+constexpr uint8_t ECU_RESET_SUB_FUNCTION = 0x01;
+constexpr uint8_t SID_ECU_RESET_RESPONSE = 0x51;
 
 // ============================================================
 // Shared data
@@ -84,6 +92,15 @@ void SendPositiveUdsResponse(uint8_t cmdHi, uint8_t cmdLow)
                   response[0], response[1], response[2], response[3]);
 }
 
+void SendResetPositiveResponse()
+{
+    Serial.write(SID_ECU_RESET_RESPONSE);
+    Serial.write(ECU_RESET_SUB_FUNCTION);
+    Serial.println();
+    Serial.printf("[RX] UDSResp(%02X%02X)\n", SID_ECU_RESET_RESPONSE, ECU_RESET_SUB_FUNCTION);
+    Serial.flush();
+}
+
 bool IsVoltageTargetReached(uint16_t currentVoltageV, bool increaseTarget, uint8_t targetVoltageV)
 {
     if (increaseTarget)
@@ -127,6 +144,13 @@ void CompleteVoltageAdjustment()
     SendPositiveUdsResponse(CMD_SET_VOLTAGE_TARGET_HI, CMD_SET_VOLTAGE_TARGET_LOW);
 }
 
+void ResetMcu()
+{
+    SendResetPositiveResponse();
+    delay(100);
+    ESP.restart();
+}
+
 void ProcessCommand(const uint8_t *data, uint8_t length)
 {
     if (length == 0)
@@ -135,7 +159,22 @@ void ProcessCommand(const uint8_t *data, uint8_t length)
     const uint8_t *frame = data;
     uint8_t frameLength = length;
 
-    if (length == COMMAND_FRAME_WITH_LENGTH_LENGTH)
+    if (length == RESET_COMMAND_FRAME_WITH_LENGTH_LENGTH)
+    {
+        if (data[0] != RESET_COMMAND_LENGTH_BYTE)
+        {
+            Serial.printf("[RX] Invalid reset frame length byte: 0x%02X\n", data[0]);
+            return;
+        }
+
+        frame = data + 1;
+        frameLength = RESET_COMMAND_FRAME_LENGTH;
+    }
+    else if (length == RESET_COMMAND_FRAME_LENGTH)
+    {
+        frameLength = RESET_COMMAND_FRAME_LENGTH;
+    }
+    else if (length == COMMAND_FRAME_WITH_LENGTH_LENGTH)
     {
         if (data[0] != COMMAND_LENGTH_BYTE)
         {
@@ -156,6 +195,19 @@ void ProcessCommand(const uint8_t *data, uint8_t length)
 
     switch (sid)
     {
+        case SID_ECU_RESET:
+        {
+            if (frameLength != RESET_COMMAND_FRAME_LENGTH || frame[1] != ECU_RESET_SUB_FUNCTION)
+            {
+                Serial.println("[RX] Invalid ECU reset subfunction");
+                return;
+            }
+
+            Serial.println("[RX] ECU reset requested");
+            ResetMcu();
+            break;
+        }
+
         case SID_SET_SERVO_ANGLE:
         {
             if (frameLength != COMMAND_FRAME_LENGTH)
@@ -260,14 +312,24 @@ void SerialRxTask()
 
         if (receivedLength == 0)
         {
-            if (rxByte != SID_SET_SERVO_ANGLE && rxByte != COMMAND_LENGTH_BYTE)
+            if (rxByte != SID_SET_SERVO_ANGLE &&
+                rxByte != SID_ECU_RESET &&
+                rxByte != COMMAND_LENGTH_BYTE &&
+                rxByte != RESET_COMMAND_LENGTH_BYTE)
             {
                 Serial.printf("[RX] Invalid header: 0x%02X\n", rxByte);
                 continue;
             }
 
             rxBuffer[receivedLength++] = rxByte;
-            expectedLength = (rxByte == COMMAND_LENGTH_BYTE) ? COMMAND_FRAME_WITH_LENGTH_LENGTH : COMMAND_FRAME_LENGTH;
+            if (rxByte == COMMAND_LENGTH_BYTE)
+                expectedLength = COMMAND_FRAME_WITH_LENGTH_LENGTH;
+            else if (rxByte == RESET_COMMAND_LENGTH_BYTE)
+                expectedLength = RESET_COMMAND_FRAME_WITH_LENGTH_LENGTH;
+            else if (rxByte == SID_ECU_RESET)
+                expectedLength = RESET_COMMAND_FRAME_LENGTH;
+            else
+                expectedLength = COMMAND_FRAME_LENGTH;
             continue;
         }
 
@@ -391,7 +453,7 @@ void setup()
 
     pinMode(ADC_INPUT_PIN, INPUT);
     g_servo.attach(SERVO_PIN);
-    g_servo.writeMicroseconds(1500); // stop at startup
+    g_servo.writeMicroseconds(SERVO_STOP_US); // stop at startup
 
     Serial.println("[INIT] Servo initialized on D2");
     Serial.println("[INIT] ADC voltage monitoring enabled on A0");
