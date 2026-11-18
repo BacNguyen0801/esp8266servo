@@ -1,4 +1,3 @@
-
 #include <Arduino.h>
 #include <Servo.h>
 
@@ -10,7 +9,7 @@ constexpr uint8_t SERVO_PIN = 4;
 
 constexpr uint32_t RX_TASK_INTERVAL_MS    = 10;
 constexpr uint32_t MOTOR_TASK_INTERVAL_MS = 20;
-constexpr uint32_t ALIVE_TASK_INTERVAL_MS = 1000;
+constexpr uint32_t ALIVE_TASK_INTERVAL_MS = 10000;
 
 constexpr uint8_t MAX_FRAME_LENGTH = 8;
 constexpr uint8_t COMMAND_LENGTH_BYTE = 0x05;
@@ -20,10 +19,11 @@ constexpr uint8_t COMMAND_FRAME_WITH_LENGTH_LENGTH = 6; // [LEN, SID, CH, 0xF0, 
 constexpr uint16_t SERVO_STOP_US = 1500;
 constexpr uint16_t SERVO_CLOCKWISE_US = 1600;
 constexpr uint16_t SERVO_ANTICLOCKWISE_US = 1400;
-constexpr uint32_t SERVO_RUN_DURATION_MS = 100;
+constexpr uint32_t SERVO_RUN_DURATION_MS = 50;
 constexpr uint8_t ADC_INPUT_PIN = A0;
 constexpr uint8_t ADC_VOLTAGE_MIN_TARGET_TENTHS = 3;  // 0.3V in 0.1V units
 constexpr uint8_t ADC_VOLTAGE_MAX_TARGET_TENTHS = 24; // 2.4V in 0.1V units
+constexpr uint8_t ADC_VOLTAGE_TARGET_OFFSET_TENTHS = 10; // 1.0 V in 0.1 V units
 constexpr uint16_t ADC_MAX_RAW = 1023;
 constexpr uint16_t ADC_FULL_SCALE_VOLTAGE_MV = 3300; // ADC sees 0..3.3V
 
@@ -49,8 +49,9 @@ volatile uint32_t g_commandStartMs = 0;
 volatile bool g_voltageControlActive = false;
 volatile bool g_voltageIncreaseTarget = false;
 volatile uint8_t g_voltageTargetV = 0;
+volatile uint16_t g_lastMeasuredVoltageV = 0;
+volatile uint8_t g_voltageUnchangedCount = 0;
 
-uint16_t g_currentPulseUs = SERVO_STOP_US;
 uint32_t g_aliveCounter = 0;
 
 Servo g_servo;
@@ -85,9 +86,32 @@ void SendPositiveUdsResponse(uint8_t cmdHi, uint8_t cmdLow)
 
 bool IsVoltageTargetReached(uint16_t currentVoltageV, bool increaseTarget, uint8_t targetVoltageV)
 {
-    return increaseTarget
-        ? (currentVoltageV >= static_cast<uint16_t>(targetVoltageV))
-        : (currentVoltageV <= static_cast<uint16_t>(targetVoltageV));
+    if (increaseTarget)
+    {
+        const uint16_t lowerTargetV = targetVoltageV > ADC_VOLTAGE_TARGET_OFFSET_TENTHS
+            ? targetVoltageV - ADC_VOLTAGE_TARGET_OFFSET_TENTHS
+            : 0;
+        return currentVoltageV >= lowerTargetV;
+    }
+
+    const uint16_t upperTargetV = targetVoltageV + ADC_VOLTAGE_TARGET_OFFSET_TENTHS;
+    return currentVoltageV <= upperTargetV;
+}
+
+bool IsVoltageUnchanged(uint16_t currentVoltageV)
+{
+    if (currentVoltageV == g_lastMeasuredVoltageV)
+    {
+        if (g_voltageUnchangedCount < 255)
+            ++g_voltageUnchangedCount;
+    }
+    else
+    {
+        g_lastMeasuredVoltageV = currentVoltageV;
+        g_voltageUnchangedCount = 0;
+    }
+
+    return g_voltageUnchangedCount >= 5;
 }
 
 void CompleteVoltageAdjustment()
@@ -97,7 +121,8 @@ void CompleteVoltageAdjustment()
     g_voltageControlActive = false;
     g_voltageIncreaseTarget = false;
     g_voltageTargetV = 0;
-    g_currentPulseUs = SERVO_STOP_US;
+    g_lastMeasuredVoltageV = 0;
+    g_voltageUnchangedCount = 0;
 
     SendPositiveUdsResponse(CMD_SET_VOLTAGE_TARGET_HI, CMD_SET_VOLTAGE_TARGET_LOW);
 }
@@ -196,6 +221,8 @@ void ProcessCommand(const uint8_t *data, uint8_t length)
                 g_voltageControlActive = true;
                 g_voltageIncreaseTarget = shouldIncrease;
                 g_voltageTargetV = value;
+                g_lastMeasuredVoltageV = currentVoltageV;
+                g_voltageUnchangedCount = 0;
                 g_newCommand = true;
 
                 Serial.printf("[RX] Set voltage target: %u V, current %u V -> %s\n",
@@ -275,38 +302,38 @@ void MotorControlTask()
     const uint32_t elapsedMs = millis() - g_commandStartMs;
 
     if (g_voltageControlActive)
-    {
-        const uint16_t currentVoltageV = ReadMeasuredVoltageV();
-
-        if (IsVoltageTargetReached(currentVoltageV, g_voltageIncreaseTarget, g_voltageTargetV))
-        {
-            CompleteVoltageAdjustment();
-            Serial.printf("[MOTOR] Voltage target reached: %u V (target %u V, elapsed %lu ms)\n",
-                          currentVoltageV,
-                          g_voltageTargetV,
-                          (unsigned long)elapsedMs);
-            return;
-        }
-
+    {    
         if (elapsedMs >= SERVO_RUN_DURATION_MS)
         {
-            g_servo.writeMicroseconds(SERVO_STOP_US);
-            g_currentPulseUs = SERVO_STOP_US;
+            const uint16_t targetVoltageV = g_voltageTargetV;
+            const uint16_t currentVoltageV = ReadMeasuredVoltageV();
 
+            g_servo.writeMicroseconds(SERVO_STOP_US);
+            
             const uint16_t measuredAfterStopV = ReadMeasuredVoltageV();
+
+            Serial.printf("[MOTOR] Voltage after stop: %u V (target %u V, elapsed %lu ms)\n",
+                          measuredAfterStopV,
+                          targetVoltageV,
+                          (unsigned long)elapsedMs);
             const bool finishedAfterStop = IsVoltageTargetReached(
                 measuredAfterStopV,
                 g_voltageIncreaseTarget,
-                g_voltageTargetV
+                targetVoltageV
             );
-
-            Serial.printf("[MOTOR] Step complete: %u V / %u V -> %s\n",
-                          measuredAfterStopV,
-                          g_voltageTargetV,
-                          finishedAfterStop ? "done" : "continue");
 
             if (finishedAfterStop)
             {
+                CompleteVoltageAdjustment();
+                return;
+            }
+
+            if (IsVoltageUnchanged(currentVoltageV))
+            {
+                Serial.printf("[MOTOR] Voltage unchanged 3 times: stopped at %u V (target %u V, elapsed %lu ms)\n",
+                            currentVoltageV,
+                            targetVoltageV,
+                            (unsigned long)elapsedMs);
                 CompleteVoltageAdjustment();
                 return;
             }
@@ -315,17 +342,7 @@ void MotorControlTask()
             return;
         }
 
-        const bool needIncrease = currentVoltageV < static_cast<uint16_t>(g_voltageTargetV);
-        const uint16_t pulseUs = needIncrease ? SERVO_CLOCKWISE_US : SERVO_ANTICLOCKWISE_US;
-
-        g_servo.writeMicroseconds(pulseUs);
-        g_currentPulseUs = pulseUs;
-
-        Serial.printf("[MOTOR] Voltage step: %u V / %u V -> %s, elapsed %lu ms\n",
-                      currentVoltageV,
-                      g_voltageTargetV,
-                      needIncrease ? "clockwise" : "anticlockwise",
-                      (unsigned long)elapsedMs);
+        g_servo.writeMicroseconds(g_targetPulseUs);
         return;
     }
 
@@ -333,22 +350,16 @@ void MotorControlTask()
     {
         g_servo.writeMicroseconds(SERVO_STOP_US);
         g_newCommand = false;
-        g_currentPulseUs = SERVO_STOP_US;
-
-        SendPositiveUdsResponse(CMD_SET_SERVO_DIRECTION_HI, CMD_SET_SERVO_DIRECTION_LOW);
-
         Serial.printf("[MOTOR] Stop after %lu ms -> %u us\n",
                       (unsigned long)SERVO_RUN_DURATION_MS,
                       SERVO_STOP_US);
+        SendPositiveUdsResponse(CMD_SET_SERVO_DIRECTION_HI, CMD_SET_SERVO_DIRECTION_LOW);
         return;
     }
 
-    const uint16_t pulseUs = g_targetPulseUs;
-    g_servo.writeMicroseconds(pulseUs);
-    g_currentPulseUs = pulseUs;
-
+    g_servo.writeMicroseconds(g_targetPulseUs);
     Serial.printf("[MOTOR] Active pulse: %u us (elapsed %lu ms)\n",
-                  pulseUs,
+                  g_targetPulseUs,
                   (unsigned long)elapsedMs);
 }
 
@@ -372,7 +383,7 @@ void AliveMonitorTask()
 
 void setup()
 {
-    Serial.begin(115200);
+    Serial.begin(921600);
     delay(500);
 
     Serial.println();

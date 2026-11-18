@@ -92,6 +92,20 @@ def parse_raw_command(command_hex):
 
     raise ValueError("Command must resolve to either 5 bytes (31 01 <F0/C0> 01 <value>) or 6 bytes (05 31 01 <F0/C0> 01 <value>)")
 
+def has_uds_response(received):
+    if b"UDSResp" in received:
+        return True
+
+    for index in range(max(0, len(received) - 3)):
+        if (received[index] == 0x71 and
+                received[index + 1] == SERVO_CHANNEL and
+                received[index + 2] in (SERVO_CMD_HI, SERVO_VOLTAGE_CMD_HI) and
+                received[index + 3] == SERVO_CMD_LOW):
+            return True
+
+    return False
+
+
 def send_serial_bytes(port_name, payload):
     port_name = normalize_port_name(port_name)
 
@@ -100,22 +114,52 @@ def send_serial_bytes(port_name, payload):
 
         with serial.Serial(
             port=port_name,
-            baudrate=115200,
+            baudrate=921600,
             bytesize=serial.EIGHTBITS,
             parity=serial.PARITY_NONE,
             stopbits=serial.STOPBITS_ONE,
-            timeout=1,
-            write_timeout=2
+            timeout=0.02,
+            write_timeout=0.5
         ) as ser:
+            ser.reset_input_buffer()
+
             print(f"PORT OPENED: {port_name}")
             written = ser.write(payload)
             ser.flush()
 
             print(f"Bytes transmitted: {written}/{len(payload)}")
 
-            time.sleep(0.1)
+            deadline = time.monotonic() + 5.0
+            received = bytearray()
+
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    print("Timeout: UDS response not received within 1 second")
+                    print(f"PORT CLOSED: {port_name}")
+                    return False
+
+                chunk = ser.read(min(64, 256))
+                if chunk:
+                    received.extend(chunk)
+
+                    if has_uds_response(received):
+                        print("UDS response received")
+                        break
+
+                    try:
+                        text = chunk.decode("ascii").replace("\r", "").strip()
+                    except UnicodeDecodeError:
+                        text = ""
+
+                    if text:
+                        print(f"UART received: {text}")
+                    else:
+                        hex_text = " ".join(f"{byte:02X}" for byte in chunk)
+                        print(f"UART received: HEX: {hex_text}")
 
         print(f"PORT CLOSED: {port_name}")
+        return True
 
     except Exception as exc:
         print(f"Serial error: {type(exc).__name__}: {exc}")
@@ -124,13 +168,13 @@ def send_serial_bytes(port_name, payload):
 
 def send_raw_command_via_serial(port_name, command_hex):
     payload = parse_raw_command(command_hex)
-    send_serial_bytes(port_name, payload)
+    return send_serial_bytes(port_name, payload)
 
 
 
 try:
     from PyQt5.QtSerialPort import QSerialPort, QSerialPortInfo
-    from PyQt5.QtWidgets import QApplication, QComboBox, QHBoxLayout, QLabel, QPushButton, QSpinBox, QVBoxLayout, QWidget
+    from PyQt5.QtWidgets import QApplication, QComboBox, QHBoxLayout, QLabel, QPushButton, QSpinBox, QTextEdit, QVBoxLayout, QWidget
 except ImportError:
     QSerialPort = None
     QSerialPortInfo = None
@@ -142,6 +186,7 @@ except ImportError:
     QSpinBox = None
     QVBoxLayout = None
     QWidget = None
+    QTextEdit = None
 
 
 class ServoControlWindow(QWidget):
@@ -149,7 +194,7 @@ class ServoControlWindow(QWidget):
         super().__init__()
         self.serial_port = None
         self.setWindowTitle("ESP8266 Servo UART Control")
-        self.resize(460, 200)
+        self.resize(460, 420)
         self.setStyleSheet(
             """
             QWidget {
@@ -219,12 +264,28 @@ class ServoControlWindow(QWidget):
             QPushButton#rightBtn:hover {
                 background: #d97706;
             }
+            QTextEdit {
+                background: #111827;
+                color: #d1fae5;
+                border: 1px solid #374151;
+                border-radius: 8px;
+                padding: 8px;
+                font-family: "Consolas", "Courier New", monospace;
+                font-size: 13px;
+            }
+            QTextEdit[readOnly="true"] {
+                background: #111827;
+                color: #d1fae5;
+            }
             """
         )
 
         self.port_combo = QComboBox()
-        self.status_label = QLabel("Ready")
-        self.status_label.setStyleSheet("padding-top: 8px; font-weight: 600;")
+
+        self.command_log = QTextEdit()
+        self.command_log.setReadOnly(True)
+        self.command_log.setPlaceholderText("UART command log")
+        self.command_log.setMinimumHeight(150)
 
         self.connection_btn = QPushButton("Connect")
         self.connection_btn.setObjectName("connectToggleBtn")
@@ -262,9 +323,25 @@ class ServoControlWindow(QWidget):
         root_layout.addLayout(port_row)
         root_layout.addLayout(voltage_row)
         root_layout.addLayout(button_row)
-        root_layout.addWidget(self.status_label)
+        root_layout.addWidget(QLabel("Command Log:"))
+        root_layout.addWidget(self.command_log, 1)
 
         self.refresh_ports()
+
+    def append_log(self, message):
+        timestamp = time.strftime("%H:%M:%S")
+        self.command_log.append(f"[{timestamp}] {message}")
+
+    def format_received_bytes(self, bytes_data):
+        hex_text = " ".join(f"{b:02X}" for b in bytes_data)
+        try:
+            ascii_text = bytes_data.decode("ascii").replace("\r", "").strip()
+        except UnicodeDecodeError:
+            ascii_text = ""
+
+        if ascii_text:
+            return f"{ascii_text}"
+        return f"HEX: {hex_text}"
 
     def refresh_ports(self):
         ports = [port.portName() for port in QSerialPortInfo.availablePorts()]
@@ -273,9 +350,8 @@ class ServoControlWindow(QWidget):
 
         if ports:
             self.port_combo.setCurrentIndex(0)
-            self.status_label.setText("Ready")
         else:
-            self.status_label.setText("No COM ports found")
+            self.append_log("NO COM PORTS FOUND")
 
     def toggle_connection(self):
         if self.serial_port and self.serial_port.isOpen():
@@ -286,7 +362,7 @@ class ServoControlWindow(QWidget):
     def connect_port(self):
         port_name = self.port_combo.currentText()
         if not port_name:
-            self.status_label.setText("Select a COM port first")
+            self.append_log("SELECT A COM PORT FIRST")
             return
 
         if self.serial_port is not None and self.serial_port.isOpen():
@@ -294,7 +370,7 @@ class ServoControlWindow(QWidget):
 
         self.serial_port = QSerialPort()
         self.serial_port.setPortName(port_name)
-        self.serial_port.setBaudRate(QSerialPort.Baud115200)
+        self.serial_port.setBaudRate(921600)
         self.serial_port.setDataBits(QSerialPort.Data8)
         self.serial_port.setParity(QSerialPort.NoParity)
         self.serial_port.setStopBits(QSerialPort.OneStop)
@@ -304,21 +380,22 @@ class ServoControlWindow(QWidget):
 
         if self.serial_port.open(QSerialPort.ReadWrite):
             self.connection_btn.setText("Disconnect")
-            self.status_label.setText(f"Connected to {port_name}")
+            self.append_log(f"CONNECTED: {port_name}")
         else:
             self.connection_btn.setText("Connect")
-            self.status_label.setText(f"Failed to connect to {port_name}")
+            self.append_log(f"CONNECTION FAILED: {port_name}")
             self.serial_port = None
 
     def disconnect_port(self):
         if not self.serial_port or not self.serial_port.isOpen():
             self.connection_btn.setText("Connect")
-            self.status_label.setText("No active connection")
+            self.append_log("NO ACTIVE CONNECTION")
             return
 
+        port_name = self.serial_port.portName()
         self.serial_port.close()
         self.connection_btn.setText("Connect")
-        self.status_label.setText("Disconnected")
+        self.append_log(f"DISCONNECTED: {port_name}")
 
     def handle_serial_data(self):
         if not self.serial_port or not self.serial_port.isOpen():
@@ -332,12 +409,12 @@ class ServoControlWindow(QWidget):
         if not bytes_data:
             return
 
-        hex_text = " ".join(f"{b:02X}" for b in bytes_data)
-        self.status_label.setText(f"UART receive: {hex_text}")
+        receive_text = self.format_received_bytes(bytes_data)
+        self.append_log(f"RECEIVED: {receive_text}")
 
     def send_direction(self, direction):
         if not self.serial_port or not self.serial_port.isOpen():
-            self.status_label.setText("Connect to a COM port first")
+            self.append_log("CONNECT TO A COM PORT FIRST")
             return
 
         packet = bytes([FRAME_LENGTH_BYTE, SERVO_SID, SERVO_CHANNEL, SERVO_CMD_HI, SERVO_CMD_LOW, direction])
@@ -345,18 +422,14 @@ class ServoControlWindow(QWidget):
         self.serial_port.flush()
 
         if written >= 0:
-            direction_name = "anti-clockwise" if direction == DIRECTION_LEFT else "clockwise"
-            cmd_code = "01" if direction == DIRECTION_LEFT else "00"
             uart_hex = " ".join(f"{b:02X}" for b in packet)
-            self.status_label.setText(
-                f"UART send: {uart_hex} | rotate {direction_name} ({cmd_code})"
-            )
+            self.append_log(f"SENT: {uart_hex}")
         else:
-            self.status_label.setText("Failed to send command")
+            self.append_log("FAILED TO SEND COMMAND")
 
     def send_voltage_target(self):
         if not self.serial_port or not self.serial_port.isOpen():
-            self.status_label.setText("Connect to a COM port first")
+            self.append_log("CONNECT TO A COM PORT FIRST")
             return
 
         target_v = self.target_voltage_spin.value()
@@ -366,11 +439,11 @@ class ServoControlWindow(QWidget):
 
         if written >= 0:
             uart_hex = " ".join(f"{b:02X}" for b in packet)
-            self.status_label.setText(
-                f"UART send: {uart_hex} | target {target_v} V"
+            self.append_log(
+                f"SENT: {uart_hex} | target {target_v} V"
             )
         else:
-            self.status_label.setText("Failed to send voltage target")
+            self.append_log("FAILED TO SEND VOLTAGE TARGET")
 
     def closeEvent(self, event):
         if self.serial_port and self.serial_port.isOpen():
@@ -381,20 +454,20 @@ class ServoControlWindow(QWidget):
 def build_cli_parser():
     parser = argparse.ArgumentParser(description="ESP8266 servo UART controller")
     parser.add_argument("-COM", "--com", dest="com_port", help="COM port, for example 4 or COM4")
-    parser.add_argument("-cmd", "--cmd", dest="command_hex", help="Raw UART command in hex, for example 053101f00100, 3101c0010f, or UDSReq(3101C0010F)")
+    parser.add_argument("-cmd", "--cmd", dest="command_hex", help="Raw UART command in hex")
     return parser
 
 
 if __name__ == "__main__":
-    parser = build_cli_parser()
-    args, remaining = parser.parse_known_args()
+    cli_parser = build_cli_parser()
+    cli_args, _ = cli_parser.parse_known_args()
 
-    if args.com_port or args.command_hex:
-        if not args.com_port or not args.command_hex:
-            parser.error("Both -COM and -cmd are required when using CLI mode")
+    if cli_args.com_port or cli_args.command_hex:
+        if not cli_args.com_port or not cli_args.command_hex:
+            cli_parser.error("Both -COM and -cmd are required when using CLI mode")
         try:
-            send_raw_command_via_serial(args.com_port, args.command_hex)
-            sys.exit(0)
+            response_received = send_raw_command_via_serial(cli_args.com_port, cli_args.command_hex)
+            sys.exit(0 if response_received else 1)
         except Exception as exc:
             print(f"Error: {exc}", file=sys.stderr)
             sys.exit(1)
