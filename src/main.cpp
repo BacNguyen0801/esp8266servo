@@ -21,8 +21,8 @@ constexpr uint8_t RESET_COMMAND_FRAME_LENGTH = 2; // [SID, SUB_FUNCTION]
 constexpr uint8_t RESET_COMMAND_FRAME_WITH_LENGTH_LENGTH = 3; // [LEN, SID, SUB_FUNCTION]
 
 constexpr uint16_t SERVO_STOP_US = 1500;
-constexpr uint16_t SERVO_CLOCKWISE_US = 1600;
-constexpr uint16_t SERVO_ANTICLOCKWISE_US = 1400;
+constexpr uint16_t SERVO_CLOCKWISE_US = 1700;
+constexpr uint16_t SERVO_ANTICLOCKWISE_US = 1300;
 constexpr uint32_t SERVO_RUN_DURATION_MS = 50;
 constexpr uint8_t ADC_INPUT_PIN = A0;
 constexpr uint8_t ADC_VOLTAGE_MIN_TARGET_TENTHS = 3;  // 0.3V in 0.1V units
@@ -30,6 +30,8 @@ constexpr uint8_t ADC_VOLTAGE_MAX_TARGET_TENTHS = 24; // 2.4V in 0.1V units
 constexpr uint8_t ADC_VOLTAGE_TARGET_OFFSET_VOLT = 1; // 1.0 V in 0.1 V units
 constexpr uint16_t ADC_MAX_RAW = 1023;
 constexpr uint16_t ADC_FULL_SCALE_VOLTAGE_MV = 3300; // ADC sees 0..3.3V
+constexpr uint8_t ADC_SAMPLE_COUNT = 10;
+constexpr uint32_t ADC_SAMPLE_DELAY_MS = 10;
 
 // ============================================================
 // UDS-style Service IDs
@@ -47,6 +49,8 @@ constexpr uint8_t SID_ECU_RESET = 0x11;
 constexpr uint8_t ECU_RESET_SUB_FUNCTION = 0x01;
 constexpr uint8_t SID_ECU_RESET_RESPONSE = 0x51;
 
+constexpr uint32_t ADC_MONITOR_DELAY_MS = 100;
+
 // ============================================================
 // Shared data
 // ============================================================
@@ -59,6 +63,7 @@ volatile bool g_voltageIncreaseTarget = false;
 volatile uint8_t g_voltageTargetV = 0;
 volatile uint16_t g_lastMeasuredVoltageV = 0;
 volatile uint8_t g_voltageUnchangedCount = 0;
+volatile uint32_t g_motorRunDurationMs = SERVO_RUN_DURATION_MS;
 
 uint32_t g_aliveCounter = 0;
 
@@ -70,9 +75,19 @@ Servo g_servo;
 
 uint16_t ReadMeasuredVoltageV()
 {
-    const uint16_t raw = analogRead(ADC_INPUT_PIN);
+    uint32_t rawSum = 0;
+    for (uint8_t i = 0; i < ADC_SAMPLE_COUNT; ++i)
+    {
+        rawSum += analogRead(ADC_INPUT_PIN);
+        if (i + 1 < ADC_SAMPLE_COUNT)
+        {
+            delay(ADC_SAMPLE_DELAY_MS);
+        }
+    }
 
-    const uint32_t adcMv = (static_cast<uint32_t>(raw) * ADC_FULL_SCALE_VOLTAGE_MV + (ADC_MAX_RAW / 2)) / ADC_MAX_RAW;
+    const uint16_t averagedRaw = static_cast<uint16_t>(
+        (rawSum + (ADC_SAMPLE_COUNT / 2)) / ADC_SAMPLE_COUNT);
+    const uint32_t adcMv = (static_cast<uint32_t>(averagedRaw) * ADC_FULL_SCALE_VOLTAGE_MV + (ADC_MAX_RAW / 2)) / ADC_MAX_RAW;
     return (adcMv * 10u + 500u) / 1000u; // convert 0..3.3V ADC value to 0..33V real scale, then keep in 0.1V units
 }
 
@@ -106,14 +121,10 @@ bool IsVoltageTargetReached(uint16_t currentVoltageV, bool increaseTarget, uint8
 {
     if (increaseTarget)
     {
-        const uint16_t lowerTargetV = targetVoltageV > ADC_VOLTAGE_TARGET_OFFSET_VOLT
-            ? targetVoltageV - ADC_VOLTAGE_TARGET_OFFSET_VOLT
-            : 0;
-        return currentVoltageV >= lowerTargetV;
+        return currentVoltageV >= targetVoltageV;
     }
 
-    const uint16_t upperTargetV = targetVoltageV + ADC_VOLTAGE_TARGET_OFFSET_VOLT;
-    return currentVoltageV <= upperTargetV;
+    return currentVoltageV <= targetVoltageV;
 }
 
 bool IsVoltageUnchanged(uint16_t currentVoltageV)
@@ -139,6 +150,7 @@ void CompleteVoltageAdjustment()
     g_voltageControlActive = false;
     g_voltageIncreaseTarget = false;
     g_voltageTargetV = 0;
+    g_motorRunDurationMs = SERVO_RUN_DURATION_MS;
     g_lastMeasuredVoltageV = 0;
     g_voltageUnchangedCount = 0;
 
@@ -284,6 +296,10 @@ void ProcessCommand(const uint8_t *data, uint8_t length)
                 g_voltageControlActive = true;
                 g_voltageIncreaseTarget = shouldIncrease;
                 g_voltageTargetV = value;
+                g_motorRunDurationMs = static_cast<uint32_t>(
+                    currentVoltageV >= value
+                        ? currentVoltageV - value
+                        : value - currentVoltageV) * 50u;
                 g_lastMeasuredVoltageV = currentVoltageV;
                 g_voltageUnchangedCount = 0;
                 g_newCommand = true;
@@ -376,7 +392,7 @@ void MotorControlTask()
 
     if (g_voltageControlActive)
     {    
-        if (elapsedMs >= SERVO_RUN_DURATION_MS)
+        if (elapsedMs >= g_motorRunDurationMs)
         {
             const uint16_t targetVoltageV = g_voltageTargetV;
             const uint16_t currentVoltageV = ReadMeasuredVoltageV();
@@ -384,11 +400,6 @@ void MotorControlTask()
             g_servo.writeMicroseconds(SERVO_STOP_US);
             
             const uint16_t measuredAfterStopV = ReadMeasuredVoltageV();
-
-            Serial.printf("[MOTOR] Current Voltage: %u V (target %u V, elapsed %lu ms)\n",
-                          measuredAfterStopV,
-                          targetVoltageV,
-                          (unsigned long)elapsedMs);
             const bool finishedAfterStop = IsVoltageTargetReached(
                 measuredAfterStopV,
                 g_voltageIncreaseTarget,
@@ -404,6 +415,10 @@ void MotorControlTask()
                 CompleteVoltageAdjustment();
                 return;
             }
+            Serial.printf("[MOTOR] Current Voltage: %u V (target %u V, elapsed %lu ms)\n",
+                          measuredAfterStopV,
+                          targetVoltageV,
+                          (unsigned long)elapsedMs);
 
             if (IsVoltageUnchanged(currentVoltageV))
             {
@@ -415,6 +430,7 @@ void MotorControlTask()
                 return;
             }
 
+            g_motorRunDurationMs = SERVO_RUN_DURATION_MS;
             g_commandStartMs = millis();
             return;
         }
