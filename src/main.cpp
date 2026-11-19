@@ -27,7 +27,7 @@ constexpr uint32_t SERVO_RUN_DURATION_MS = 50;
 constexpr uint8_t ADC_INPUT_PIN = A0;
 constexpr uint8_t ADC_VOLTAGE_MIN_TARGET_TENTHS = 3;  // 0.3V in 0.1V units
 constexpr uint8_t ADC_VOLTAGE_MAX_TARGET_TENTHS = 24; // 2.4V in 0.1V units
-constexpr uint8_t ADC_VOLTAGE_TARGET_OFFSET_TENTHS = 10; // 1.0 V in 0.1 V units
+constexpr uint8_t ADC_VOLTAGE_TARGET_OFFSET_VOLT = 1; // 1.0 V in 0.1 V units
 constexpr uint16_t ADC_MAX_RAW = 1023;
 constexpr uint16_t ADC_FULL_SCALE_VOLTAGE_MV = 3300; // ADC sees 0..3.3V
 
@@ -71,6 +71,7 @@ Servo g_servo;
 uint16_t ReadMeasuredVoltageV()
 {
     const uint16_t raw = analogRead(ADC_INPUT_PIN);
+
     const uint32_t adcMv = (static_cast<uint32_t>(raw) * ADC_FULL_SCALE_VOLTAGE_MV + (ADC_MAX_RAW / 2)) / ADC_MAX_RAW;
     return (adcMv * 10u + 500u) / 1000u; // convert 0..3.3V ADC value to 0..33V real scale, then keep in 0.1V units
 }
@@ -105,13 +106,13 @@ bool IsVoltageTargetReached(uint16_t currentVoltageV, bool increaseTarget, uint8
 {
     if (increaseTarget)
     {
-        const uint16_t lowerTargetV = targetVoltageV > ADC_VOLTAGE_TARGET_OFFSET_TENTHS
-            ? targetVoltageV - ADC_VOLTAGE_TARGET_OFFSET_TENTHS
+        const uint16_t lowerTargetV = targetVoltageV > ADC_VOLTAGE_TARGET_OFFSET_VOLT
+            ? targetVoltageV - ADC_VOLTAGE_TARGET_OFFSET_VOLT
             : 0;
         return currentVoltageV >= lowerTargetV;
     }
 
-    const uint16_t upperTargetV = targetVoltageV + ADC_VOLTAGE_TARGET_OFFSET_TENTHS;
+    const uint16_t upperTargetV = targetVoltageV + ADC_VOLTAGE_TARGET_OFFSET_VOLT;
     return currentVoltageV <= upperTargetV;
 }
 
@@ -268,6 +269,16 @@ void ProcessCommand(const uint8_t *data, uint8_t length)
 
                 const uint16_t currentVoltageV = ReadMeasuredVoltageV();
                 const bool shouldIncrease = currentVoltageV < value;
+
+                if (IsVoltageTargetReached(currentVoltageV, shouldIncrease, value))
+                {
+                    Serial.printf("[RX] Voltage target already reached: %u V (target %u V)\n",
+                                  currentVoltageV,
+                                  value);
+                    CompleteVoltageAdjustment();
+                    break;
+                }
+
                 g_targetPulseUs = shouldIncrease ? SERVO_CLOCKWISE_US : SERVO_ANTICLOCKWISE_US;
                 g_commandStartMs = millis();
                 g_voltageControlActive = true;
@@ -374,7 +385,7 @@ void MotorControlTask()
             
             const uint16_t measuredAfterStopV = ReadMeasuredVoltageV();
 
-            Serial.printf("[MOTOR] Voltage after stop: %u V (target %u V, elapsed %lu ms)\n",
+            Serial.printf("[MOTOR] Current Voltage: %u V (target %u V, elapsed %lu ms)\n",
                           measuredAfterStopV,
                           targetVoltageV,
                           (unsigned long)elapsedMs);
@@ -386,6 +397,10 @@ void MotorControlTask()
 
             if (finishedAfterStop)
             {
+                Serial.printf("[MOTOR] Voltage target reached after stop: %u V (target %u V, elapsed %lu ms)\n",
+                              measuredAfterStopV,
+                              targetVoltageV,
+                              (unsigned long)elapsedMs);
                 CompleteVoltageAdjustment();
                 return;
             }
