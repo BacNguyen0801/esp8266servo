@@ -149,7 +149,7 @@ def send_serial_bytes(port_name, payload):
             while True:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    print("Timeout: UDS response not received within 1 second")
+                    print("Timeout: UDS response not received within 5 second")
                     print(f"PORT CLOSED: {port_name}")
                     return False
 
