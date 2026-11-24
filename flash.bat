@@ -3,7 +3,7 @@
 setlocal EnableExtensions
 
 REM ============================================================
-REM ESP8266 Automatic GitHub Firmware Downloader and Flasher
+REM ESP Firmware Downloader and Flasher
 REM ============================================================
 
 set "REPO=BacNguyen0801/esp8266servo"
@@ -13,6 +13,7 @@ set "FIRMWARE=firmware.bin"
 set "BAUD=115200"
 set "COM_PORT="
 set "LOCAL_FIRMWARE="
+set "CHIP=esp8266"
 
 set "DOWNLOAD_DIR=%~dp0downloads"
 set "ZIP_FILE=%DOWNLOAD_DIR%\firmware.zip"
@@ -43,6 +44,14 @@ if /I "%~1"=="-baud" (
     goto parse_args
 )
 
+if /I "%~1"=="-chip" (
+    if "%~2"=="" goto usage
+    set "CHIP=%~2"
+    shift
+    shift
+    goto parse_args
+)
+
 if /I "%~1"=="-f" (
     if "%~2"=="" goto usage
     set "LOCAL_FIRMWARE=%~2"
@@ -66,6 +75,17 @@ goto usage
 
 if not defined COM_PORT goto usage
 
+if /I "%CHIP%"=="esp8266" (
+    set "CHIP=esp8266"
+    set "ARTIFACT=esp8266-nodemcu-firmware"
+) else if /I "%CHIP%"=="esp32" (
+    set "CHIP=esp32"
+    set "ARTIFACT=esp32dev-firmware"
+) else (
+    echo ERROR: Unsupported chip %CHIP%. Use esp8266 or esp32.
+    exit /b 1
+)
+
 REM Normalize COM port
 if /I "%COM_PORT:~0,3%"=="COM" (
     set "COM_PORT=%COM_PORT:~3%"
@@ -74,10 +94,11 @@ set "COM_PORT=COM%COM_PORT%"
 
 echo.
 echo ============================================================
-echo       ESP8266 AUTOMATIC FIRMWARE FLASHER
+echo       AUTOMATIC ESP FIRMWARE FLASHER
 echo ============================================================
 echo Repository : %REPO%
 echo Branch     : %BRANCH%
+echo Chip       : %CHIP%
 echo COM Port   : %COM_PORT%
 echo Baud Rate  : %BAUD%
 if defined LOCAL_FIRMWARE (
@@ -144,26 +165,50 @@ if errorlevel 1 (
 )
 
 REM ============================================================
-REM [3/4] Flash ESP8266
+REM [3/4] Flash firmware (esptool detects the chip)
 REM ============================================================
 
 :flash_local
 
 echo.
-echo [3/4] Flashing ESP8266...
+echo [3/4] Flashing %CHIP% firmware...
 echo Firmware: %FIRMWARE_PATH%
+for %%I in ("%FIRMWARE_PATH%") do set "ESP32_DIR=%%~dpI"
 
-python -m esptool ^
-    --chip esp8266 ^
-    --port %COM_PORT% ^
-    --baud %BAUD% ^
-    write-flash ^
-    0x0 ^
-    "%FIRMWARE_PATH%"
+if /I "%CHIP%"=="esp8266" (
+    python -m esptool ^
+        --chip esp8266 ^
+        --port %COM_PORT% ^
+        --baud %BAUD% ^
+        write-flash ^
+        0x0 ^
+        "%FIRMWARE_PATH%"
+) else (
+    if not exist "%ESP32_DIR%\bootloader.bin" (
+        echo ERROR: ESP32 bootloader.bin not found beside firmware: %ESP32_DIR%
+        exit /b 1
+    )
+    if not exist "%ESP32_DIR%\partitions.bin" (
+        echo ERROR: ESP32 partitions.bin not found beside firmware: %ESP32_DIR%
+        exit /b 1
+    )
+
+    python -m esptool ^
+        --chip esp32 ^
+        --port %COM_PORT% ^
+        --baud %BAUD% ^
+        write-flash ^
+        --flash-mode dio ^
+        --flash-freq 40m ^
+        --flash-size detect ^
+        0x1000 "%ESP32_DIR%\bootloader.bin" ^
+        0x8000 "%ESP32_DIR%\partitions.bin" ^
+        0x10000 "%FIRMWARE_PATH%"
+)
 
 if errorlevel 1 (
     echo.
-    echo ERROR: ESP8266 flashing failed.
+    echo ERROR: Firmware flashing failed.
     exit /b 1
 )
 
@@ -173,10 +218,11 @@ REM ============================================================
 
 echo.
 echo ============================================================
-echo       ESP8266 FIRMWARE UPDATE SUCCESSFUL
+echo       FIRMWARE UPDATE SUCCESSFUL
 echo ============================================================
 echo Repository : %REPO%
 echo Branch     : %BRANCH%
+echo Chip       : %CHIP%
 echo Firmware   : %FIRMWARE%
 echo COM Port   : %COM_PORT%
 echo ============================================================
@@ -189,6 +235,9 @@ echo Usage:
 echo   flash.bat -COM 3
 echo   flash.bat -COM COM3
 echo   flash.bat -COM 3 -baud 460800
-echo   flash.bat -COM 4 -f .pio\build\nodemcuv2\firmware.bin
+echo   flash.bat -COM 4 -chip esp8266
+echo   flash.bat -COM 4 -chip esp32
+echo   flash.bat -COM 4 -chip esp8266 -f .pio\build\nodemcuv2\firmware.bin
+echo   flash.bat -COM 4 -chip esp32 -f .pio\build\esp32dev\firmware.bin
 echo.
 exit /b 1

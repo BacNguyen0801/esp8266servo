@@ -30,9 +30,19 @@ jobs:
       - name: Build firmware
         run: pio run
 
-      - name: Upload firmware
+      - name: Upload ESP8266 firmware
         uses: actions/upload-artifact@v4
         with:
           name: esp8266-nodemcu-firmware
           path: .pio/build/nodemcuv2/firmware.bin
+          if-no-files-found: error
+
+      - name: Upload ESP32 firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp32dev-firmware
+          path: |
+            .pio/build/esp32dev/firmware.bin
+            .pio/build/esp32dev/bootloader.bin
+            .pio/build/esp32dev/partitions.bin
           if-no-files-found: error

@@ -1,17 +1,28 @@
 #include <Arduino.h>
+#if defined(ARDUINO_ARCH_ESP32)
+#include <ESP32Servo.h>
+#else
 #include <Servo.h>
+#endif
 #include <Esp.h>
+#include "wifi_connection.h"
 
 // ============================================================
 // Configuration
 // ============================================================
 
-constexpr uint8_t SERVO_PIN = 4;
+#if defined(ARDUINO_ARCH_ESP32)
+constexpr uint8_t SERVO_PIN = 4; // ESP32 DevKit D2 GPIO
+#else
+constexpr uint8_t SERVO_PIN = D2; // ESP8266 NodeMCU D2 GPIO
+#endif
 
 constexpr uint32_t RX_TASK_INTERVAL_MS    = 10;
 constexpr uint32_t MOTOR_TASK_INTERVAL_MS = 20;
 constexpr uint32_t MOTOR_MONITOR_TASK_INTERVAL_MS = 10;
 constexpr uint32_t ALIVE_TASK_INTERVAL_MS = 10000;
+constexpr uint32_t WIFI_TASK_INTERVAL_MS = 100;
+constexpr uint32_t WIFI_RETRY_INTERVAL_MS = 10000;
 
 constexpr uint8_t MAX_FRAME_LENGTH = 8;
 constexpr uint8_t COMMAND_LENGTH_BYTE = 0x05;
@@ -25,13 +36,45 @@ constexpr uint16_t SERVO_STOP_US = 1500;
 constexpr uint16_t SERVO_CLOCKWISE_US = 1550;
 constexpr uint16_t SERVO_ANTICLOCKWISE_US = 1450;
 constexpr uint32_t SERVO_RUN_DURATION_MS = 50;
+#if defined(ARDUINO_ARCH_ESP32)
+constexpr uint8_t ADC_INPUT_PIN = 36; // ESP32 DevKit A0 / VP
+constexpr uint8_t ADC_VOLTAGE_MIN_TARGET = 3;
+constexpr uint8_t ADC_VOLTAGE_MAX_TARGET = 24;
+constexpr uint8_t DAC_OUTPUT_PIN = 25;
+#else
 constexpr uint8_t ADC_INPUT_PIN = A0;
-constexpr uint8_t ADC_VOLTAGE_MIN_TARGET_TENTHS = 3;  // 0.3V in 0.1V units
-constexpr uint8_t ADC_VOLTAGE_MAX_TARGET_TENTHS = 24; // 2.4V in 0.1V units
-constexpr uint8_t ADC_VOLTAGE_TARGET_OFFSET_VOLT = 1; // 1.0 V in 0.1 V units
-constexpr uint16_t ADC_MAX_RAW = 1023;
-constexpr uint16_t ADC_FULL_SCALE_VOLTAGE_MV = 33; // ADC sees 0..3.3V
-constexpr uint8_t ADC_WINDOW_SIZE = 3U; // number of samples for moving average
+constexpr uint8_t ADC_VOLTAGE_MIN_TARGET = 3;
+constexpr uint8_t ADC_VOLTAGE_MAX_TARGET = 24;
+#endif
+#if defined(ARDUINO_ARCH_ESP32)
+struct AdcCalibrationPoint
+{
+    uint16_t raw;
+    uint32_t physicalVoltageMv;
+};
+
+constexpr AdcCalibrationPoint ADC_CALIBRATION_TABLE[] = {
+    {0, 0},
+    {240, 3300},
+    {409, 4700},
+    {815, 8230},
+    {1120, 10730},
+    {1194, 11340},  
+    {1412, 13180},
+    {1530, 14150},
+    {1709, 15600},
+    {2014, 18220},
+    {2336, 20000},
+    {2813, 24800},
+    {4095, 33000},
+};
+constexpr uint16_t ADC_FULL_SCALE_INPUT_MV = 4095;
+constexpr uint16_t ADC_FULL_SCALE_PHYSICAL_MV = 33000;
+#else
+constexpr uint16_t ADC_FULL_SCALE_INPUT_MV = 1023;
+constexpr uint16_t ADC_FULL_SCALE_PHYSICAL_MV = 33000;
+#endif
+constexpr uint8_t ADC_WINDOW_SIZE = 4U; // number of samples for moving average
 
 // ============================================================
 // UDS-style Service IDs
@@ -49,7 +92,7 @@ constexpr uint8_t SID_ECU_RESET = 0x11;
 constexpr uint8_t ECU_RESET_SUB_FUNCTION = 0x01;
 constexpr uint8_t SID_ECU_RESET_RESPONSE = 0x51;
 
-constexpr uint32_t ADC_MONITOR_DELAY_MS = 100;
+constexpr uint32_t VOLTAGE_UNCHANGED_OFFSET_MV = 100;
 
 // Pulse offset (us) from neutral, indexed by absolute voltage gap in 0.1V units.
 constexpr uint16_t g_pulseMotorTableReference[24] = {
@@ -68,20 +111,21 @@ volatile uint32_t g_commandStartMs = 0;
 volatile bool g_voltageControlActive = false;
 volatile bool g_stopMotorRequested = false;
 volatile bool g_voltageIncreaseTarget = false;
-volatile uint8_t g_voltageTargetV = 0;
-volatile uint16_t g_lastMeasuredVoltageV = 0;
+volatile uint32_t g_voltageTargetMv = 0;
+volatile uint32_t g_lastMeasuredVoltageMv = 0;
 volatile uint8_t g_voltageUnchangedCount = 0;
 volatile uint32_t g_lastVoltageMonitorMs = 0;
 
 uint32_t g_aliveCounter = 0;
 
 Servo g_servo;
+WifiConnection g_wifiConnection;
 
 // ============================================================
 // Command processing
 // ============================================================
 
-uint16_t ReadMeasuredVoltageV()
+uint32_t ReadMeasuredVoltageMv()
 {
     static uint16_t samples[ADC_WINDOW_SIZE] = {};
     static uint8_t sampleCount = 0;
@@ -102,10 +146,37 @@ uint16_t ReadMeasuredVoltageV()
     nextSampleIndex = (nextSampleIndex + 1) % ADC_WINDOW_SIZE;
 
     const uint16_t averagedRaw = static_cast<uint16_t>(
-        (rawSum + (sampleCount / 2)) / sampleCount);
+        (rawSum / sampleCount)
+    );
 
-    const uint32_t physicalVoltage = (static_cast<uint32_t>(averagedRaw) * ADC_FULL_SCALE_VOLTAGE_MV)>>10U;
-    return physicalVoltage; // convert 0..3.3V ADC value to 0..33V real scale, then keep in 0.1V units
+    Serial.printf("[ADC] Raw: %u, Avg: %u, Samples: %u\n",
+                  analogRead(ADC_INPUT_PIN),
+                  averagedRaw,
+                  sampleCount);
+
+    if (averagedRaw >= ADC_FULL_SCALE_INPUT_MV)
+        return ADC_FULL_SCALE_PHYSICAL_MV;
+
+#if defined(ARDUINO_ARCH_ESP32)
+    for (size_t i = 1; i < sizeof(ADC_CALIBRATION_TABLE) / sizeof(ADC_CALIBRATION_TABLE[0]); ++i)
+    {
+        const AdcCalibrationPoint &lower = ADC_CALIBRATION_TABLE[i - 1];
+        const AdcCalibrationPoint &upper = ADC_CALIBRATION_TABLE[i];
+        if (averagedRaw <= upper.raw)
+        {
+            return lower.physicalVoltageMv +
+                (static_cast<uint32_t>(averagedRaw - lower.raw) *
+                 (upper.physicalVoltageMv - lower.physicalVoltageMv)) /
+                    (upper.raw - lower.raw);
+        }
+    }
+
+    return ADC_CALIBRATION_TABLE[
+        sizeof(ADC_CALIBRATION_TABLE) / sizeof(ADC_CALIBRATION_TABLE[0]) - 1
+    ].physicalVoltageMv;
+#else
+    return (static_cast<uint32_t>(averagedRaw) * ADC_FULL_SCALE_PHYSICAL_MV) / ADC_FULL_SCALE_INPUT_MV;
+#endif
 }
 
 void SendPositiveUdsResponse(uint8_t cmdHi, uint8_t cmdLow)
@@ -134,23 +205,31 @@ void SendResetPositiveResponse()
     Serial.flush();
 }
 
-bool IsVoltageTargetReached(uint16_t currentVoltageV, bool increaseTarget, uint8_t targetVoltageV)
+bool IsVoltageTargetReached(uint32_t currentVoltageMv,
+                            bool increaseTarget,
+                            uint32_t targetVoltageMv)
 {
     if (increaseTarget)
     {
-        return currentVoltageV >= targetVoltageV;
+        return currentVoltageMv >= targetVoltageMv;
     }
 
-    return currentVoltageV <= targetVoltageV;
+    return currentVoltageMv <= targetVoltageMv;
 }
 
-uint16_t GetVoltageControlPulseUs(uint16_t currentVoltageV, uint16_t targetVoltageV, bool increaseTarget)
+uint16_t GetVoltageControlPulseUs(uint32_t currentVoltageMv,
+                                  uint32_t targetVoltageMv,
+                                  bool increaseTarget)
 {
-    const uint16_t voltageGap = currentVoltageV > targetVoltageV
-        ? currentVoltageV - targetVoltageV
-        : targetVoltageV - currentVoltageV;
+    const uint32_t voltageGapMv = currentVoltageMv > targetVoltageMv
+        ? currentVoltageMv - targetVoltageMv
+        : targetVoltageMv - currentVoltageMv;
+    const uint16_t voltageGapTenths =
+        static_cast<uint16_t>((voltageGapMv + 50U) / 100U);
     const uint16_t maxGapIndex = (sizeof(g_pulseMotorTableReference) / sizeof(g_pulseMotorTableReference[0])) - 1;
-    const uint16_t gapIndex = voltageGap < maxGapIndex ? voltageGap : maxGapIndex;
+    const uint16_t gapIndex = voltageGapTenths < maxGapIndex
+        ? voltageGapTenths
+        : maxGapIndex;
     const uint16_t pulseOffsetUs = g_pulseMotorTableReference[gapIndex];
 
     return increaseTarget
@@ -158,16 +237,29 @@ uint16_t GetVoltageControlPulseUs(uint16_t currentVoltageV, uint16_t targetVolta
         : SERVO_STOP_US - pulseOffsetUs;
 }
 
-bool IsVoltageUnchanged(uint16_t currentVoltageV)
+bool IsVoltageUnchanged(uint32_t currentVoltageMv)
 {
-    if (currentVoltageV == g_lastMeasuredVoltageV)
+    if (g_lastMeasuredVoltageMv == 0)
     {
-        if (g_voltageUnchangedCount < 255)
-            ++g_voltageUnchangedCount;
+        g_lastMeasuredVoltageMv = currentVoltageMv;
+        g_voltageUnchangedCount = 0;
+        return false;
+    }
+
+    const uint32_t voltageDifferenceMv =
+        currentVoltageMv > g_lastMeasuredVoltageMv
+            ? currentVoltageMv - g_lastMeasuredVoltageMv
+            : g_lastMeasuredVoltageMv - currentVoltageMv;
+
+    if (voltageDifferenceMv <= VOLTAGE_UNCHANGED_OFFSET_MV)
+    {
+        uint8_t unchangedCount = g_voltageUnchangedCount;
+        if (unchangedCount < 255)
+            g_voltageUnchangedCount = unchangedCount + 1;
     }
     else
     {
-        g_lastMeasuredVoltageV = currentVoltageV;
+        g_lastMeasuredVoltageMv = currentVoltageMv;
         g_voltageUnchangedCount = 0;
     }
 
@@ -186,8 +278,8 @@ void CompleteVoltageAdjustment()
     g_stopMotorRequested = true;
     g_voltageControlActive = false;
     g_voltageIncreaseTarget = false;
-    g_voltageTargetV = 0;
-    g_lastMeasuredVoltageV = 0;
+    g_voltageTargetMv = 0;
+    g_lastMeasuredVoltageMv = 0;
     g_voltageUnchangedCount = 0;
 
     SendPositiveUdsResponse(CMD_SET_VOLTAGE_TARGET_HI, CMD_SET_VOLTAGE_TARGET_LOW);
@@ -299,7 +391,7 @@ void ProcessCommand(const uint8_t *data, uint8_t length)
                 g_voltageControlActive = false;
                 g_stopMotorRequested = false;
                 g_voltageIncreaseTarget = false;
-                g_voltageTargetV = 0;
+                g_voltageTargetMv = 0;
                 g_newCommand = true;
 
                 Serial.printf("[RX] Set servo direction: %s -> %u us\n",
@@ -310,38 +402,45 @@ void ProcessCommand(const uint8_t *data, uint8_t length)
 
             if (cmdHi == CMD_SET_VOLTAGE_TARGET_HI && cmdLow == CMD_SET_VOLTAGE_TARGET_LOW)
             {
-                if (value < ADC_VOLTAGE_MIN_TARGET_TENTHS || value > ADC_VOLTAGE_MAX_TARGET_TENTHS)
+                if (value < ADC_VOLTAGE_MIN_TARGET || value > ADC_VOLTAGE_MAX_TARGET)
                 {
-                    Serial.printf("[RX] Invalid target voltage: %u (valid 3..24 in 0.1V units = 0.3..2.4V)\n", value);
+#if defined(ARDUINO_ARCH_ESP32)
+                    Serial.printf("[RX] Invalid target voltage: %u (valid 3..24 V)\n", value);
+#else
+                    Serial.printf("[RX] Invalid target voltage: %u (valid 3..24 V)\n", value);
+#endif
                     return;
                 }
 
-                const uint16_t currentVoltageV = ReadMeasuredVoltageV();
-                const bool shouldIncrease = currentVoltageV < value;
+                const uint32_t currentVoltageMv = ReadMeasuredVoltageMv();
+                const uint32_t targetVoltageMv =
+                    static_cast<uint32_t>(value) * 1000U;
+                const bool shouldIncrease = currentVoltageMv < targetVoltageMv;
 
-                if (IsVoltageTargetReached(currentVoltageV, shouldIncrease, value))
+                if (IsVoltageTargetReached(currentVoltageMv, shouldIncrease, targetVoltageMv))
                 {
-                    Serial.printf("[RX] Voltage target already reached: %u V (target %u V)\n",
-                                  currentVoltageV,
-                                  value);
+                    Serial.printf("[RX] Voltage target already reached: %lu mV (target %lu mV)\n",
+                                  (unsigned long)currentVoltageMv,
+                                  (unsigned long)targetVoltageMv);
                     CompleteVoltageAdjustment();
                     break;
                 }
 
-                g_targetPulseUs = GetVoltageControlPulseUs(currentVoltageV, value, shouldIncrease);
+                g_targetPulseUs = GetVoltageControlPulseUs(
+                    currentVoltageMv, targetVoltageMv, shouldIncrease);
                 g_commandStartMs = millis();
                 g_voltageControlActive = true;
                 g_stopMotorRequested = false;
                 g_voltageIncreaseTarget = shouldIncrease;
-                g_voltageTargetV = value;
-                g_lastMeasuredVoltageV = currentVoltageV;
+                g_voltageTargetMv = targetVoltageMv;
+                g_lastMeasuredVoltageMv = currentVoltageMv;
                 g_voltageUnchangedCount = 0;
                 g_lastVoltageMonitorMs = g_commandStartMs;
                 g_newCommand = true;
 
-                Serial.printf("[RX] Set voltage target: %u V, current %u V -> %s\n",
-                              value,
-                              currentVoltageV,
+                Serial.printf("[RX] Set voltage target: %lu mV, current %lu mV -> %s\n",
+                              (unsigned long)targetVoltageMv,
+                              (unsigned long)currentVoltageMv,
                               shouldIncrease ? "clockwise" : "anticlockwise");
                 break;
             }
@@ -471,29 +570,29 @@ void MonitorConditionStopMotor()
     }
 
     g_lastVoltageMonitorMs = now;
-    const uint16_t currentVoltageV = ReadMeasuredVoltageV();
-    const uint16_t targetVoltageV = g_voltageTargetV;
+    const uint32_t currentVoltageMv = ReadMeasuredVoltageMv();
+    const uint32_t targetVoltageMv = g_voltageTargetMv;
 
-    if (IsVoltageTargetReached(currentVoltageV, g_voltageIncreaseTarget, targetVoltageV))
+    if (IsVoltageTargetReached(currentVoltageMv, g_voltageIncreaseTarget, targetVoltageMv))
     {
-        Serial.printf("[MOTOR] Voltage target reached: %u V (target %u V, elapsed %lu ms)\n",
-                      currentVoltageV,
-                      targetVoltageV,
+        Serial.printf("[MOTOR] Voltage target reached: %lu mV (target %lu mV, elapsed %lu ms)\n",
+                      (unsigned long)currentVoltageMv,
+                      (unsigned long)targetVoltageMv,
                       (unsigned long)(millis() - g_commandStartMs));
         RequestMotorStop();
         return;
     }
 
     g_targetPulseUs = GetVoltageControlPulseUs(
-        currentVoltageV,
-        targetVoltageV,
+        currentVoltageMv,
+        targetVoltageMv,
         g_voltageIncreaseTarget);
 
-    if (IsVoltageUnchanged(currentVoltageV))
+    if (IsVoltageUnchanged(currentVoltageMv))
     {
-        Serial.printf("[MOTOR] Voltage unchanged 5 times: stopped at %u V (target %u V, elapsed %lu ms)\n",
-                      currentVoltageV,
-                      targetVoltageV,
+        Serial.printf("[MOTOR] Voltage unchanged 5 times: stopped at %lu mV (target %lu mV, elapsed %lu ms)\n",
+                      (unsigned long)currentVoltageMv,
+                      (unsigned long)targetVoltageMv,
                       (unsigned long)(millis() - g_commandStartMs));
         RequestMotorStop();
     }
@@ -508,9 +607,35 @@ void AliveMonitorTask()
     ++g_aliveCounter;
 
     Serial.printf(
-        "[MCU] ESP8266 Alive! Counter: %lu\n",
+        "[MCU] eMotor Alive! Counter: %lu\n",
         (unsigned long)g_aliveCounter
     );
+}
+
+void WifiConnectionTask()
+{
+    static bool connectionAttempted = false;
+    static uint32_t lastConnectionAttemptMs = 0;
+
+    const bool alreadyConnected = g_wifiConnection.isConnected();
+    const bool credentialsChanged = g_wifiConnection.isChanged();
+    if (g_wifiConnection.getSsid().length() == 0 ||
+        (alreadyConnected && !credentialsChanged))
+        return;
+
+    const uint32_t now = millis();
+    if (connectionAttempted && !credentialsChanged &&
+        now - lastConnectionAttemptMs < WIFI_RETRY_INTERVAL_MS)
+        return;
+
+    const bool started = connectionAttempted || credentialsChanged
+        ? g_wifiConnection.reconnect()
+        : g_wifiConnection.connect();
+    if (started)
+    {
+        connectionAttempted = true;
+        lastConnectionAttemptMs = now;
+    }
 }
 
 // ============================================================
@@ -521,17 +646,33 @@ void setup()
 {
     Serial.begin(921600);
     delay(500);
-
-    Serial.println();
-    Serial.println("ESP8266 NodeMCU Started");
-
     pinMode(ADC_INPUT_PIN, INPUT);
+#if defined(ARDUINO_ARCH_ESP32)
+    dacWrite(DAC_OUTPUT_PIN, 85); // Set DAC output to mid-scale (1.65V) for reference
+    analogReadResolution(12);
+    analogSetPinAttenuation(ADC_INPUT_PIN, ADC_11db);
+#endif
     g_servo.attach(SERVO_PIN);
     g_servo.writeMicroseconds(SERVO_STOP_US); // stop at startup
 
-    Serial.println("[INIT] Servo initialized on D2");
-    Serial.println("[INIT] ADC voltage monitoring enabled on A0");
+    Serial.print("[INIT] Servo initialized on ");
+#if defined(ARDUINO_ARCH_ESP32)
+    Serial.println("ESP32 GPIO 4");
+    Serial.println("[INIT] ADC voltage monitoring enabled on ESP32 GPIO 36");
+#else
+    Serial.println("ESP8266 D2");
+    Serial.println("[INIT] ADC voltage monitoring enabled on ESP8266 A0");
+#endif
     Serial.println("[INIT] Binary RX protocol enabled");
+
+    if (g_wifiConnection.begin())
+    {
+        Serial.println("[INIT] Wi-Fi storage initialized");
+    }
+    else
+    {
+        Serial.println("[INIT] Wi-Fi storage initialization failed");
+    }
 }
 
 // ============================================================
@@ -544,6 +685,7 @@ void loop()
     static uint32_t lastMotorTask = 0;
     static uint32_t lastMotorMonitorTask = 0;
     static uint32_t lastAliveTask = 0;
+    static uint32_t lastWifiTask = 0;
 
     uint32_t now = millis();
 
@@ -569,6 +711,12 @@ void loop()
     {
         lastAliveTask = now;
         AliveMonitorTask();
+    }
+
+    if (now - lastWifiTask >= WIFI_TASK_INTERVAL_MS)
+    {
+        lastWifiTask = now;
+        WifiConnectionTask();
     }
 
     yield();
